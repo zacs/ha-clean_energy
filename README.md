@@ -2,6 +2,8 @@
 
 A Home Assistant custom component that detects and corrects anomalous spikes in energy sensors.
 
+_Disclosure: Viibe-coded. Sorry._
+
 ## The problem
 
 Some energy sensors (especially cheaper smart plugs and meters) occasionally report bogus values — enormous jumps like 100,000 kWh in a single reading. These spikes corrupt your Energy Dashboard totals and cost calculations.
