@@ -15,8 +15,9 @@ from datetime import datetime
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry, SOURCE_DISCOVERY
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, UnitOfEnergy
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform, UnitOfEnergy
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
@@ -26,9 +27,12 @@ from .const import (
     DEFAULT_MAX_POWER_KW,
     DOMAIN,
     MIN_ELAPSED_SECONDS,
+    SIGNAL_SPIKE_CORRECTED,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+PLATFORMS = [Platform.SENSOR]
 
 # Conversion factors to kWh
 _TO_KWH: dict[str, float] = {
@@ -189,8 +193,13 @@ class CleanEnergyHub:
                 self.max_power_kw,
                 jump_kwh,
             )
-            self.hass.async_create_task(
-                _adjust_statistics(self.hass, entity_id, -jump_kwh)
+            _adjust_statistics(self.hass, entity_id, -jump_kwh)
+            # Notify diagnostic sensors
+            async_dispatcher_send(
+                self.hass,
+                f"{SIGNAL_SPIKE_CORRECTED}_{entity_id}",
+                jump_kwh,
+                now,
             )
         else:
             # Unmanaged sensor: offer discovery (once per entity per session)
@@ -232,16 +241,24 @@ class CleanEnergyHub:
 # Statistics correction
 # ---------------------------------------------------------------------------
 
-async def _adjust_statistics(
+@callback
+def _adjust_statistics(
     hass: HomeAssistant, entity_id: str, adjustment_kwh: float
 ) -> None:
-    """Adjust the long-term statistics sum for an entity."""
+    """Adjust the long-term statistics sum for an entity.
+
+    Uses the public async_adjust_statistics API which queues an
+    AdjustStatisticsTask on the recorder thread.
+    """
     try:
-        await get_instance(hass).async_add_executor_job(
-            _do_adjust_statistics, hass, entity_id, adjustment_kwh
+        get_instance(hass).async_adjust_statistics(
+            statistic_id=entity_id,
+            start_time=dt_util.utcnow(),
+            sum_adjustment=adjustment_kwh,
+            adjustment_unit="kWh",
         )
         _LOGGER.info(
-            "Clean Energy: statistics for %s adjusted by %.3f kWh",
+            "Clean Energy: statistics adjustment queued for %s (%.3f kWh)",
             entity_id,
             adjustment_kwh,
         )
@@ -249,22 +266,6 @@ async def _adjust_statistics(
         _LOGGER.exception(
             "Clean Energy: failed to adjust statistics for %s", entity_id
         )
-
-
-def _do_adjust_statistics(
-    hass: HomeAssistant, entity_id: str, adjustment_kwh: float
-) -> None:
-    """Call recorder to adjust statistics (runs in executor)."""
-    from homeassistant.components.recorder.statistics import adjust_statistics
-
-    now = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
-    adjust_statistics(
-        get_instance(hass),
-        statistic_id=entity_id,
-        start_time=now,
-        sum_adjustment=adjustment_kwh,
-        adjustment_unit_of_measurement="kWh",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +299,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entity_id:
         _LOGGER.info("Clean Energy: now managing %s", entity_id)
 
+        # Forward sensor platform for diagnostic entities
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
         # If this entry was created from discovery, correct the triggering spike
         pending_kwh = entry.data.get("spike_jump_kwh")
         if pending_kwh and pending_kwh > 0:
@@ -306,8 +310,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 entity_id,
                 pending_kwh,
             )
-            hass.async_create_task(
-                _adjust_statistics(hass, entity_id, -pending_kwh)
+            _adjust_statistics(hass, entity_id, -pending_kwh)
+            # Notify the diagnostic sensors about the initial correction too
+            async_dispatcher_send(
+                hass,
+                f"{SIGNAL_SPIKE_CORRECTED}_{entity_id}",
+                pending_kwh,
+                dt_util.utcnow(),
             )
 
     return True
@@ -315,6 +324,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    entity_id = entry.data.get(CONF_ENTITY_ID)
+    if entity_id:
+        if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+            return False
+
     remaining = [
         e
         for e in hass.config_entries.async_entries(DOMAIN)

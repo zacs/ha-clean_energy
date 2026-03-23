@@ -17,10 +17,8 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
-    SOURCE_DISCOVERY,
 )
 from homeassistant.core import callback
-from homeassistant.helpers import entity_registry as er
 
 from .const import CONF_ENTITY_ID, CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW, DOMAIN
 
@@ -202,7 +200,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
         """Get the options flow."""
-        return CleanEnergyOptionsFlow(config_entry)
+        return CleanEnergyOptionsFlow()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -218,9 +216,6 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class CleanEnergyOptionsFlow(OptionsFlow):
     """Options flow - only shown on the hub entry (no entity_id in data)."""
-
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        self.config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
