@@ -1,0 +1,27 @@
+# Add this to your configuration.yaml (or include it via: template: !include test_sensor.yaml)
+#
+# Simulates a total_increasing energy sensor that:
+# - Increments by 0.001–0.05 kWh every 10 seconds (normal residential noise)
+# - ~5% chance per tick of a massive spike (500–5000 kWh) — roughly every 2–4 minutes
+#
+# To use: add to configuration.yaml under "template:" key, then restart HA.
+# To remove: delete this block and restart.
+
+- trigger:
+    - platform: time_pattern
+      seconds: "/10"
+  sensor:
+    - name: "Clean Energy Test Sensor"
+      unique_id: clean_energy_test_sensor
+      unit_of_measurement: "kWh"
+      device_class: energy
+      state_class: total_increasing
+      state: >
+        {% set current = this.state | float(0) %}
+        {% set normal = (range(1, 50) | random) / 1000 %}
+        {% set is_spike = (range(1, 100) | random) <= 5 %}
+        {% if is_spike %}
+          {{ (current + (range(500, 5000) | random)) | round(3) }}
+        {% else %}
+          {{ (current + normal) | round(3) }}
+        {% endif %}
