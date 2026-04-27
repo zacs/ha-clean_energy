@@ -15,10 +15,14 @@ from datetime import datetime
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry, SOURCE_DISCOVERY
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform, UnitOfEnergy
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_STATE_CHANGED,
+    Platform,
+    UnitOfEnergy,
+)
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -96,36 +100,40 @@ class CleanEnergyHub:
         return DEFAULT_MAX_POWER_KW
 
     def start(self) -> None:
-        """Begin listening to all energy sensors."""
-        entities = [
-            s.entity_id
-            for s in self.hass.states.async_all()
-            if _is_energy_sensor(s)
-        ]
+        """Begin listening to all energy sensors.
 
-        if not entities:
-            _LOGGER.debug("Clean Energy hub: no energy sensors found yet")
-            return
-
+        We subscribe to EVENT_STATE_CHANGED on the bus rather than to a fixed
+        list of entity_ids. This way, energy sensors created *after* the hub
+        starts (yaml reloads, late-loading integrations, newly added template
+        sensors) are picked up automatically without resubscribing.
+        """
+        # Seed last_readings with currently-known energy sensors so we have a
+        # baseline for spike detection from the first observed change.
         now = dt_util.utcnow()
-        for entity_id in entities:
-            state = self.hass.states.get(entity_id)
-            if state and state.state not in ("unknown", "unavailable", None):
-                try:
-                    self._last_readings[entity_id] = (
-                        float(state.state),
-                        state.last_changed or now,
-                    )
-                except (ValueError, TypeError):
-                    pass
+        seeded = 0
+        for state in self.hass.states.async_all():
+            if not _is_energy_sensor(state):
+                continue
+            if state.state in ("unknown", "unavailable", None):
+                continue
+            try:
+                self._last_readings[state.entity_id] = (
+                    float(state.state),
+                    state.last_changed or now,
+                )
+                seeded += 1
+            except (ValueError, TypeError):
+                continue
 
         self._unsub.append(
-            async_track_state_change_event(
-                self.hass, entities, self._handle_state_change
+            self.hass.bus.async_listen(
+                EVENT_STATE_CHANGED, self._handle_state_change
             )
         )
         _LOGGER.info(
-            "Clean Energy hub: watching %d energy sensors passively", len(entities)
+            "Clean Energy hub: watching all energy sensors passively "
+            "(seeded %d known at startup)",
+            seeded,
         )
 
     def stop(self) -> None:
@@ -137,11 +145,18 @@ class CleanEnergyHub:
     @callback
     def _handle_state_change(self, event: Event) -> None:
         """Evaluate a state change for spike."""
-        entity_id = event.data["entity_id"]
         new_state = event.data.get("new_state")
 
-        if new_state is None or new_state.state in ("unknown", "unavailable"):
+        # Filter to total_increasing energy sensors only. Doing this here
+        # (rather than at subscription time) means newly created sensors are
+        # picked up automatically.
+        if not _is_energy_sensor(new_state):
             return
+
+        if new_state.state in ("unknown", "unavailable"):
+            return
+
+        entity_id = event.data["entity_id"]
 
         try:
             new_val = float(new_state.state)
