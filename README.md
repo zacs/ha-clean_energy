@@ -30,6 +30,17 @@ However, the **raw state history** (the line graph you see when clicking on an e
 
 ## Setup
 
+### Install via HACS (recommended)
+
+1. In HACS, open the three-dot menu → **Custom repositories**.
+2. Add `https://github.com/zacs/ha-clean_energy` with category **Integration**.
+3. Find **Clean Energy** in HACS and install it.
+4. Restart Home Assistant.
+5. Go to **Settings → Devices & Services → Add Integration → Clean Energy**.
+6. Set the maximum realistic power draw in kW (default: 50 kW).
+
+### Manual install
+
 1. Copy `custom_components/clean_energy` to your Home Assistant `custom_components` directory.
 2. Restart Home Assistant.
 3. Go to **Settings → Devices & Services → Add Integration → Clean Energy**.
