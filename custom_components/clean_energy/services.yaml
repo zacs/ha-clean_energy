@@ -1,0 +1,15 @@
+monitor_sensor:
+  name: Monitor sensor
+  description: >-
+    Manually start monitoring an energy sensor for spike correction, without
+    waiting for the passive watcher to detect a spike. Useful when you already
+    know a sensor is flaky but it spikes too rarely to be auto-discovered.
+  fields:
+    entity_id:
+      name: Energy sensor
+      description: The total_increasing energy sensor to start monitoring.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+          device_class: energy

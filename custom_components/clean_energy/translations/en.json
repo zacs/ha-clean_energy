@@ -33,5 +33,17 @@
         }
       }
     }
+  },
+  "services": {
+    "monitor_sensor": {
+      "name": "Monitor sensor",
+      "description": "Manually start monitoring an energy sensor for spike correction, without waiting for the passive watcher to detect a spike.",
+      "fields": {
+        "entity_id": {
+          "name": "Energy sensor",
+          "description": "The total_increasing energy sensor to start monitoring."
+        }
+      }
+    }
   }
 }

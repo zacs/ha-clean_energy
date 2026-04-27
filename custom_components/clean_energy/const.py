@@ -7,6 +7,8 @@ CONF_ENTITY_ID = "entity_id"
 
 SIGNAL_SPIKE_CORRECTED = f"{DOMAIN}_spike_corrected"
 
+SERVICE_MONITOR_SENSOR = "monitor_sensor"
+
 # 50 kW is very generous - covers large homes, EV chargers, etc.
 # A single 200A residential service tops out around 48 kW.
 DEFAULT_MAX_POWER_KW = 50.0

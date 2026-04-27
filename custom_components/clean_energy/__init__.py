@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+import voluptuous as vol
+
 from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry, SOURCE_DISCOVERY
 from homeassistant.const import (
@@ -21,8 +23,16 @@ from homeassistant.const import (
     Platform,
     UnitOfEnergy,
 )
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import (
+    Event,
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
@@ -32,6 +42,7 @@ from .const import (
     DEFAULT_MAX_POWER_KW,
     DOMAIN,
     MIN_ELAPSED_SECONDS,
+    SERVICE_MONITOR_SENSOR,
     SIGNAL_SPIKE_CORRECTED,
 )
 
@@ -294,6 +305,93 @@ def _adjust_statistics(
 
 
 # ---------------------------------------------------------------------------
+# Service: monitor a sensor on demand (no need to wait for a spike)
+# ---------------------------------------------------------------------------
+
+MONITOR_SENSOR_SCHEMA = vol.Schema(
+    {vol.Required(CONF_ENTITY_ID): cv.entity_id}
+)
+
+
+async def _async_handle_monitor_sensor(
+    hass: HomeAssistant, call: ServiceCall
+) -> ServiceResponse:
+    """Service: register an energy sensor for monitoring without waiting for a spike.
+
+    Useful when you already know a sensor is flaky but it spikes too rarely
+    for the passive watcher to discover quickly.
+    """
+    entity_id: str = call.data[CONF_ENTITY_ID]
+
+    # Validate the entity is a total_increasing energy sensor.
+    state = hass.states.get(entity_id)
+    if state is None:
+        raise ServiceValidationError(
+            f"Entity {entity_id} does not exist"
+        )
+    if not _is_energy_sensor(state):
+        raise ServiceValidationError(
+            f"Entity {entity_id} is not a total_increasing energy sensor "
+            f"(state_class={state.attributes.get('state_class')!r}, "
+            f"unit={state.attributes.get('unit_of_measurement')!r})"
+        )
+
+    # Don't allow monitoring our own diagnostic entities (would cause loops).
+    registry = er.async_get(hass)
+    registered = registry.async_get(entity_id)
+    if registered is not None and registered.platform == DOMAIN:
+        raise ServiceValidationError(
+            f"Entity {entity_id} is a Clean Energy diagnostic sensor and "
+            "cannot be monitored"
+        )
+
+    # Already monitored?
+    if entity_id in _get_managed_entity_ids(hass):
+        raise ServiceValidationError(
+            f"Entity {entity_id} is already being monitored by Clean Energy"
+        )
+
+    # Trigger a user-source flow with the entity_id pre-filled. The flow's
+    # _async_step_add_sensor will validate again, set the unique_id, and
+    # create the config entry.
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "user"},
+        data={CONF_ENTITY_ID: entity_id},
+    )
+
+    if result.get("type") == "create_entry":
+        _LOGGER.info(
+            "Clean Energy: now monitoring %s (added via service)", entity_id
+        )
+        return {"entity_id": entity_id, "status": "added"}
+
+    # Flow returned a form or aborted - surface a useful error.
+    reason = result.get("reason") or result.get("errors") or result.get("type")
+    raise ServiceValidationError(
+        f"Could not start monitoring {entity_id}: {reason}"
+    )
+
+
+@callback
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register integration services (idempotent)."""
+    if hass.services.has_service(DOMAIN, SERVICE_MONITOR_SENSOR):
+        return
+
+    async def _service(call: ServiceCall) -> ServiceResponse:
+        return await _async_handle_monitor_sensor(hass, call)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MONITOR_SENSOR,
+        _service,
+        schema=MONITOR_SENSOR_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry setup / teardown
 # ---------------------------------------------------------------------------
 
@@ -308,6 +406,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if hub is None:
         hub = CleanEnergyHub(hass)
         hass.data.setdefault(DOMAIN, {})["hub"] = hub
+
+        # Register the public service alongside the hub.
+        _async_register_services(hass)
 
         # Start after HA is fully loaded so all entities exist
         if hass.is_running:
@@ -371,6 +472,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if hub:
             hub.stop()
         hass.data.pop(DOMAIN, None)
+        # Last entry gone - tear down our services too.
+        if hass.services.has_service(DOMAIN, SERVICE_MONITOR_SENSOR):
+            hass.services.async_remove(DOMAIN, SERVICE_MONITOR_SENSOR)
 
     return True
 

@@ -49,6 +49,22 @@ However, the **raw state history** (the line graph you see when clicking on an e
 
 To manually add a sensor: go to **Add Integration → Clean Energy** again and select the sensor from the list.
 
+## Adding a sensor manually (without waiting for a spike)
+
+By default, sensors are added to monitoring via the discovery flow when the passive watcher catches a spike. If you already know a sensor is flaky and don't want to wait, you can add it manually in two ways:
+
+**From the UI:** go to **Settings → Devices & Services → Add Integration → Clean Energy** and pick the sensor from the dropdown. (The first time you add the integration this configures the global threshold; subsequent runs let you add specific sensors.)
+
+**Via service:** call `clean_energy.monitor_sensor` from **Developer Tools → Actions**, an automation, or a script:
+
+```yaml
+action: clean_energy.monitor_sensor
+data:
+  entity_id: sensor.flaky_meter
+```
+
+The service validates that the entity exists and is a `total_increasing` energy sensor, and rejects sensors that are already monitored or that belong to Clean Energy itself.
+
 ## Configuration
 
 The only setting is **Max realistic power draw (kW)** — the maximum instantaneous power any single sensor could realistically represent. The default of 50 kW covers a 200A residential service (≈48 kW). Adjust this if you have commercial or industrial sensors.
