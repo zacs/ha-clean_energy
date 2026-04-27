@@ -22,6 +22,7 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.util import dt as dt_util
 
@@ -157,6 +158,15 @@ class CleanEnergyHub:
             return
 
         entity_id = event.data["entity_id"]
+
+        # Never monitor our own diagnostic sensors. Without this guard, the
+        # "total energy corrected" sensor (a TOTAL_INCREASING energy sensor)
+        # could itself be flagged for discovery / correction, which would
+        # cause feedback loops.
+        registry = er.async_get(self.hass)
+        registered = registry.async_get(entity_id)
+        if registered is not None and registered.platform == DOMAIN:
+            return
 
         try:
             new_val = float(new_state.state)
