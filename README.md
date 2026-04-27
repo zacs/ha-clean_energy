@@ -22,6 +22,17 @@ Some energy sensors (especially cheaper smart plugs and meters) occasionally rep
 
 6. **Statistics correction**: For approved sensors, spikes are corrected by adjusting the Long-Term Statistics (LTS) sum via `recorder.adjust_statistics`. This is the same data the Energy Dashboard reads.
 
+## Sensors
+
+For each approved sensor, Clean Energy creates four diagnostic entities (named after the parent sensor, e.g. `sensor.flaky_meter_energy_removed`). Where possible they're attached to the parent sensor's device.
+
+| Entity suffix | Name | Type | Description |
+| --- | --- | --- | --- |
+| `_last_spike` | *Last Spike* | Timestamp | When the most recent spike on this sensor was detected and corrected. |
+| `_last_spike_size` | *Last Spike Size* | Energy (kWh) | Size of the most recent corrected spike. |
+| `_energy_removed` | *Energy Removed* | Energy (kWh, total increasing) | Cumulative kWh removed from this sensor's Long-Term Statistics by all corrections. Useful for the Energy Dashboard if you want to see how much bogus energy was filtered out. |
+| `_spike_count` | *Spike Count* | Counter (total increasing) | Number of spikes corrected on this sensor since it was approved. |
+
 ## Important: what gets corrected and what doesn't
 
 Clean Energy corrects the **Long-Term Statistics sum**, which is what powers the Energy Dashboard's totals and cost calculations. This means your energy totals, daily/monthly/yearly summaries, and cost tracking will be accurate.
