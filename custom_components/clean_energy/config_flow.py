@@ -184,6 +184,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="confirm",
             description_placeholders={
+                "name": self._friendly_name(entity_id),
                 "entity_id": entity_id,
                 "spike_from": str(spike_from),
                 "spike_to": str(spike_to),

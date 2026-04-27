@@ -16,12 +16,24 @@
       unit_of_measurement: "kWh"
       device_class: energy
       state_class: total_increasing
+      # Track the "true" baseline as an attribute so spikes don't permanently
+      # raise the running total. Each tick:
+      #   - baseline grows by 0.001–0.05 kWh (normal residential noise)
+      #   - ~5% of ticks emit baseline + a 500–5000 kWh spike (transient)
+      #   - all other ticks emit just the baseline (so the spike "reverts")
+      #
+      # Note: `state` reads the prior tick's baseline (templates in a
+      # trigger-based sensor all see the pre-update `this`), and the new
+      # baseline is committed via the `baseline` attribute below. This keeps
+      # the state and attribute consistent without calling random() twice.
       state: >
-        {% set current = this.state | float(0) %}
-        {% set normal = (range(1, 50) | random) / 1000 %}
+        {% set baseline = this.attributes.get('baseline', 0) | float(0) %}
         {% set is_spike = (range(1, 100) | random) <= 5 %}
         {% if is_spike %}
-          {{ (current + (range(500, 5000) | random)) | round(3) }}
+          {{ (baseline + (range(500, 5000) | random)) | round(3) }}
         {% else %}
-          {{ (current + normal) | round(3) }}
+          {{ baseline | round(3) }}
         {% endif %}
+      attributes:
+        baseline: >
+          {{ ((this.attributes.get('baseline', 0) | float(0)) + (range(1, 50) | random) / 1000) | round(3) }}

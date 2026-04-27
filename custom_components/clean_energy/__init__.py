@@ -303,6 +303,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
         # If this entry was created from discovery, correct the triggering spike
+        # ONCE - then clear the marker so HA restarts don't re-apply it.
         pending_kwh = entry.data.get("spike_jump_kwh")
         if pending_kwh and pending_kwh > 0:
             _LOGGER.info(
@@ -310,6 +311,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 entity_id,
                 pending_kwh,
             )
+            # Strip the marker from entry.data first so a crash mid-correction
+            # (or a future restart) cannot re-trigger the same adjustment.
+            new_data = {k: v for k, v in entry.data.items() if k != "spike_jump_kwh"}
+            hass.config_entries.async_update_entry(entry, data=new_data)
+
             _adjust_statistics(hass, entity_id, -pending_kwh)
             # Notify the diagnostic sensors about the initial correction too
             async_dispatcher_send(
