@@ -11,7 +11,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import voluptuous as vol
 
@@ -34,6 +34,7 @@ from homeassistant.core import (
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -216,10 +217,11 @@ class CleanEnergyHub:
         managed = _get_managed_entity_ids(self.hass)
 
         if entity_id in managed:
-            # Approved sensor: correct statistics
+            # Approved sensor: queue a deferred statistics correction.
             _LOGGER.warning(
                 "Clean Energy: SPIKE on %s: %.3f → %.3f %s over %.0fs "
-                "(implied %.1f kW, limit %.0f kW). Correcting by -%.3f kWh.",
+                "(implied %.1f kW, limit %.0f kW). Queuing -%.3f kWh "
+                "correction for after the recorder compiles this period.",
                 entity_id,
                 prev_val,
                 new_val,
@@ -229,8 +231,11 @@ class CleanEnergyHub:
                 self.max_power_kw,
                 jump_kwh,
             )
-            _adjust_statistics(self.hass, entity_id, -jump_kwh)
-            # Notify diagnostic sensors
+            entry = _entry_for_entity(self.hass, entity_id)
+            if entry is not None:
+                _queue_correction(self.hass, entry, now, jump_kwh)
+            # Notify diagnostic sensors right away—these reflect what we *will*
+            # remove, not the LTS state at this instant.
             async_dispatcher_send(
                 self.hass,
                 f"{SIGNAL_SPIKE_CORRECTED}_{entity_id}",
@@ -262,6 +267,7 @@ class CleanEnergyHub:
                             "spike_unit": unit,
                             "implied_power_kw": round(implied_power_kw, 1),
                             "spike_jump_kwh": round(jump_kwh, 3),
+                            "spike_time": now.isoformat(),
                         },
                     )
                 )
@@ -274,34 +280,165 @@ class CleanEnergyHub:
 
 
 # ---------------------------------------------------------------------------
-# Statistics correction
+# Statistics correction (deferred + persisted)
+#
+# `recorder.adjust_statistics` runs a single SQL UPDATE of the form
+#    UPDATE statistics SET sum = sum + adj WHERE start_ts >= start_time_ts
+# It does NOT persist the adjustment for rows written in the future. So if we
+# call it the moment we detect a spike, the 5-minute short-term row that
+# *contains* the spike has not been compiled yet (compilation runs at the
+# next 5-min boundary), so the UPDATE matches no rows, and when the row is
+# later inserted it carries the spike value untouched.
+#
+# Fortunately, hourly rows are not a separate problem: the recorder's hourly
+# compilation derives `sum` directly from the *last* short-term row in the
+# hour (see _compile_hourly_statistics in recorder/statistics.py). So if we
+# fix the spike's short-term row before the top-of-next-hour compilation
+# runs, the hourly row is born correct — no extra hour-long wait needed.
+#
+# So the fix is to defer the adjustment only until just after the next
+# 5-minute boundary (when the spike's short-term row is guaranteed to
+# exist), and pass `start_time = floor(spike_time, 5min)` so the spike's
+# own row is included in the UPDATE while pre-spike rows in the same hour
+# are not (otherwise the diff between rows would still show a spike).
+# Worst-case visible-error window in the Energy Dashboard: ~5½ minutes.
 # ---------------------------------------------------------------------------
 
-@callback
-def _adjust_statistics(
-    hass: HomeAssistant, entity_id: str, adjustment_kwh: float
-) -> None:
-    """Adjust the long-term statistics sum for an entity.
+PENDING_KEY = "pending_corrections"
+# Slack added on top of the next 5-minute boundary to ensure the recorder
+# has actually written the short-term row before we issue the UPDATE.
+_APPLY_SLACK = timedelta(seconds=30)
+_FIVE_MIN = timedelta(minutes=5)
 
-    Uses the public async_adjust_statistics API which queues an
-    AdjustStatisticsTask on the recorder thread.
+
+def _entry_for_entity(hass: HomeAssistant, entity_id: str) -> ConfigEntry | None:
+    """Return the per-entity config entry for the given entity_id, if any."""
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data.get(CONF_ENTITY_ID) == entity_id:
+            return entry
+    return None
+
+
+def _floor_to_5min(t: datetime) -> datetime:
+    """Floor a datetime to the start of its 5-minute statistics period."""
+    return t.replace(minute=(t.minute // 5) * 5, second=0, microsecond=0)
+
+
+def _apply_at_for(spike_time: datetime) -> datetime:
+    """Return the UTC time at which it is safe to apply a correction.
+
+    The spike's short-term row is written at the next 5-minute boundary;
+    we add a small slack to be sure the row has landed.
     """
+    next_boundary = _floor_to_5min(spike_time) + _FIVE_MIN
+    return next_boundary + _APPLY_SLACK
+
+
+@callback
+def _do_adjust(
+    hass: HomeAssistant,
+    entity_id: str,
+    spike_time: datetime,
+    jump_kwh: float,
+) -> None:
+    """Perform the actual recorder adjustment for a single spike."""
+    start_time = _floor_to_5min(spike_time)
     try:
         get_instance(hass).async_adjust_statistics(
             statistic_id=entity_id,
-            start_time=dt_util.utcnow(),
-            sum_adjustment=adjustment_kwh,
+            start_time=start_time,
+            sum_adjustment=-jump_kwh,
             adjustment_unit="kWh",
         )
         _LOGGER.info(
-            "Clean Energy: statistics adjustment queued for %s (%.3f kWh)",
+            "Clean Energy: applied -%.3f kWh adjustment to %s from %s",
+            jump_kwh,
             entity_id,
-            adjustment_kwh,
+            start_time.isoformat(),
         )
     except Exception:
         _LOGGER.exception(
             "Clean Energy: failed to adjust statistics for %s", entity_id
         )
+
+
+@callback
+def _queue_correction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    spike_time: datetime,
+    jump_kwh: float,
+) -> None:
+    """Persist a pending correction on the entry and schedule it."""
+    entity_id = entry.data.get(CONF_ENTITY_ID)
+    if not entity_id or jump_kwh <= 0:
+        return
+    pending = list(entry.data.get(PENDING_KEY, []))
+    pending.append(
+        {
+            "spike_time": spike_time.isoformat(),
+            "jump_kwh": float(jump_kwh),
+        }
+    )
+    new_data = {**entry.data, PENDING_KEY: pending}
+    hass.config_entries.async_update_entry(entry, data=new_data)
+    _schedule_correction(hass, entry, spike_time, jump_kwh)
+
+
+@callback
+def _schedule_correction(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    spike_time: datetime,
+    jump_kwh: float,
+) -> None:
+    """Schedule (or immediately run) a pending correction.
+
+    The pending entry must already be present in entry.data[PENDING_KEY];
+    this function only handles the timing and final apply.
+    """
+    entity_id = entry.data[CONF_ENTITY_ID]
+    apply_at = _apply_at_for(spike_time)
+    spike_iso = spike_time.isoformat()
+
+    @callback
+    def _apply(_now: datetime) -> None:
+        # Re-read entry to avoid clobbering concurrent writes.
+        current = list(entry.data.get(PENDING_KEY, []))
+        remaining = [p for p in current if p.get("spike_time") != spike_iso]
+        if len(remaining) != len(current):
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, PENDING_KEY: remaining}
+            )
+        _do_adjust(hass, entity_id, spike_time, jump_kwh)
+
+    now = dt_util.utcnow()
+    if apply_at <= now:
+        _apply(now)
+        return
+
+    _LOGGER.info(
+        "Clean Energy: scheduled -%.3f kWh correction for %s at %s",
+        jump_kwh,
+        entity_id,
+        apply_at.isoformat(),
+    )
+    async_track_point_in_utc_time(hass, _apply, apply_at)
+
+
+@callback
+def _replay_pending(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """On entry setup, schedule (or run) any persisted pending corrections."""
+    pending = entry.data.get(PENDING_KEY, [])
+    for item in pending:
+        try:
+            spike_time = dt_util.parse_datetime(item["spike_time"])
+            jump_kwh = float(item["jump_kwh"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if spike_time is None or jump_kwh <= 0:
+            continue
+        _schedule_correction(hass, entry, spike_time, jump_kwh)
 
 
 # ---------------------------------------------------------------------------
@@ -428,28 +565,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Forward sensor platform for diagnostic entities
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-        # If this entry was created from discovery, correct the triggering spike
-        # ONCE - then clear the marker so HA restarts don't re-apply it.
+        # If this entry was created from discovery, convert the one-shot
+        # spike marker into a persisted pending correction. Strip the marker
+        # from entry.data first so a crash mid-handoff cannot re-trigger.
         pending_kwh = entry.data.get("spike_jump_kwh")
+        spike_time_iso = entry.data.get("spike_time")
         if pending_kwh and pending_kwh > 0:
+            spike_time = (
+                dt_util.parse_datetime(spike_time_iso)
+                if spike_time_iso
+                else None
+            ) or dt_util.utcnow()
+            new_data = {
+                k: v
+                for k, v in entry.data.items()
+                if k not in ("spike_jump_kwh", "spike_time")
+            }
+            hass.config_entries.async_update_entry(entry, data=new_data)
+
             _LOGGER.info(
-                "Clean Energy: correcting triggering spike on %s (%.3f kWh)",
+                "Clean Energy: queuing triggering spike on %s (%.3f kWh)",
                 entity_id,
                 pending_kwh,
             )
-            # Strip the marker from entry.data first so a crash mid-correction
-            # (or a future restart) cannot re-trigger the same adjustment.
-            new_data = {k: v for k, v in entry.data.items() if k != "spike_jump_kwh"}
-            hass.config_entries.async_update_entry(entry, data=new_data)
-
-            _adjust_statistics(hass, entity_id, -pending_kwh)
-            # Notify the diagnostic sensors about the initial correction too
+            _queue_correction(hass, entry, spike_time, float(pending_kwh))
+            # Notify diagnostic sensors immediately so the user sees the
+            # outcome they just confirmed.
             async_dispatcher_send(
                 hass,
                 f"{SIGNAL_SPIKE_CORRECTED}_{entity_id}",
                 pending_kwh,
-                dt_util.utcnow(),
+                spike_time,
             )
+
+        # Replay any previously-persisted pending corrections (e.g. from a
+        # restart while a deferred adjustment was outstanding).
+        _replay_pending(hass, entry)
 
     return True
 

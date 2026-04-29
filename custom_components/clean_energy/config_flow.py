@@ -173,6 +173,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 data={
                     CONF_ENTITY_ID: entity_id,
                     "spike_jump_kwh": self._discovery_data.get("spike_jump_kwh", 0),
+                    "spike_time": self._discovery_data.get("spike_time"),
                 },
             )
 

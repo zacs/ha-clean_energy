@@ -39,6 +39,8 @@ Clean Energy corrects the **Long-Term Statistics sum**, which is what powers the
 
 However, the **raw state history** (the line graph you see when clicking on an entity) will still show the spike. This is cosmetic — those raw state values are recorded by the recorder before Clean Energy can intervene, and modifying the state history database directly would be fragile and risky. The data that matters (your energy totals and costs) will be correct.
 
+**Timing:** corrections are *deferred* until just after the next 5-minute statistics boundary, when the recorder has written the short-term row containing the spike. In practice that means the Energy Dashboard will continue to show a spike for up to ~5–6 minutes after detection, then it will disappear. The hourly statistic for that period is derived from the (now-corrected) short-term row, so no further wait is needed. Pending corrections are persisted to the config entry, so a restart during that window does not lose them.
+
 ## Setup
 
 ### Install via HACS (recommended)
