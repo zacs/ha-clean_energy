@@ -131,6 +131,7 @@ async def async_setup_entry(
 # History backfill
 # ---------------------------------------------------------------------------
 
+
 async def _backfill_history(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -169,16 +170,12 @@ async def _backfill_history(
     try:
         rows = await get_instance(hass).async_add_executor_job(_fetch)
     except Exception:
-        _LOGGER.exception(
-            "Clean Energy: failed to fetch LTS history for %s", source_id
-        )
+        _LOGGER.exception("Clean Energy: failed to fetch LTS history for %s", source_id)
         return
 
     series = rows.get(source_id) or []
     if not series:
-        _LOGGER.info(
-            "Clean Energy: no prior LTS history to backfill for %s", source_id
-        )
+        _LOGGER.info("Clean Energy: no prior LTS history to backfill for %s", source_id)
         hass.config_entries.async_update_entry(
             entry, data={**entry.data, BACKFILL_DONE_KEY: True}
         )
@@ -243,6 +240,7 @@ async def _backfill_history(
 # Filter sensor: a clean parallel of the source
 # ---------------------------------------------------------------------------
 
+
 class CleanFilterSensor(SensorEntity):
     """A ``total_increasing`` energy sensor that mirrors the source, sans spikes.
 
@@ -272,6 +270,7 @@ class CleanFilterSensor(SensorEntity):
         parent_object_id: str,
         parent_friendly: str,
     ) -> None:
+        """Initialise the clean filter sensor."""
         self._source_id = source_id
         self._attr_unique_id = f"{entry.entry_id}_clean"
         self._attr_suggested_object_id = f"{parent_object_id}_clean"
@@ -286,10 +285,12 @@ class CleanFilterSensor(SensorEntity):
 
     @property
     def native_value(self) -> float | None:
+        """Return the filtered energy value."""
         return self._native
 
     @property
     def native_unit_of_measurement(self) -> str:
+        """Return the unit of measurement, mirrored from the source."""
         return self._unit
 
     async def async_added_to_hass(self) -> None:
@@ -391,6 +392,7 @@ class CleanFilterSensor(SensorEntity):
 # Diagnostic sensors
 # ---------------------------------------------------------------------------
 
+
 class CleanEnergyDiagnosticSensor(SensorEntity):
     """Base class for Clean Energy diagnostic sensors."""
 
@@ -408,6 +410,7 @@ class CleanEnergyDiagnosticSensor(SensorEntity):
         parent_object_id: str,
         parent_friendly: str,
     ) -> None:
+        """Initialise the diagnostic sensor."""
         self._monitored_entity_id = monitored_entity_id
         self._attr_unique_id = f"{entry.entry_id}_{self._id_suffix}"
         self._attr_name = f"{parent_friendly} {self._name_suffix}"
@@ -416,6 +419,7 @@ class CleanEnergyDiagnosticSensor(SensorEntity):
             self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:
+        """Subscribe to the spike-corrected dispatcher signal."""
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass,
@@ -430,12 +434,19 @@ class CleanEnergyDiagnosticSensor(SensorEntity):
 
 
 class LastSpikeTimeSensor(CleanEnergyDiagnosticSensor):
+    """Records the timestamp of the most recent filtered spike."""
+
     _name_suffix = "Last Spike"
     _id_suffix = "last_spike"
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
-    def __init__(self, entry, entity_id, device_info, parent_object_id, parent_friendly):
-        super().__init__(entry, entity_id, device_info, parent_object_id, parent_friendly)
+    def __init__(
+        self, entry, entity_id, device_info, parent_object_id, parent_friendly
+    ):
+        """Initialise with a ``None`` initial value."""
+        super().__init__(
+            entry, entity_id, device_info, parent_object_id, parent_friendly
+        )
         self._attr_native_value: datetime | None = None
 
     @callback
@@ -445,14 +456,21 @@ class LastSpikeTimeSensor(CleanEnergyDiagnosticSensor):
 
 
 class LastSpikeSizeSensor(CleanEnergyDiagnosticSensor):
+    """Records the size (kWh) of the most recent filtered spike."""
+
     _name_suffix = "Last Spike Size"
     _id_suffix = "last_spike_size"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_suggested_display_precision = 3
 
-    def __init__(self, entry, entity_id, device_info, parent_object_id, parent_friendly):
-        super().__init__(entry, entity_id, device_info, parent_object_id, parent_friendly)
+    def __init__(
+        self, entry, entity_id, device_info, parent_object_id, parent_friendly
+    ):
+        """Initialise with a ``None`` initial value."""
+        super().__init__(
+            entry, entity_id, device_info, parent_object_id, parent_friendly
+        )
         self._attr_native_value: float | None = None
 
     @callback
@@ -462,6 +480,8 @@ class LastSpikeSizeSensor(CleanEnergyDiagnosticSensor):
 
 
 class TotalCorrectedSensor(CleanEnergyDiagnosticSensor):
+    """Cumulative kWh suppressed by all filtered spikes."""
+
     _name_suffix = "Energy Removed"
     _id_suffix = "energy_removed"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
@@ -469,8 +489,13 @@ class TotalCorrectedSensor(CleanEnergyDiagnosticSensor):
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_suggested_display_precision = 3
 
-    def __init__(self, entry, entity_id, device_info, parent_object_id, parent_friendly):
-        super().__init__(entry, entity_id, device_info, parent_object_id, parent_friendly)
+    def __init__(
+        self, entry, entity_id, device_info, parent_object_id, parent_friendly
+    ):
+        """Initialise the running total at zero."""
+        super().__init__(
+            entry, entity_id, device_info, parent_object_id, parent_friendly
+        )
         self._attr_native_value: float = 0.0
 
     @callback
@@ -480,13 +505,20 @@ class TotalCorrectedSensor(CleanEnergyDiagnosticSensor):
 
 
 class SpikeCountSensor(CleanEnergyDiagnosticSensor):
+    """Counts the number of spike events filtered for this source."""
+
     _name_suffix = "Spike Count"
     _id_suffix = "spike_count"
     _attr_icon = "mdi:counter"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
-    def __init__(self, entry, entity_id, device_info, parent_object_id, parent_friendly):
-        super().__init__(entry, entity_id, device_info, parent_object_id, parent_friendly)
+    def __init__(
+        self, entry, entity_id, device_info, parent_object_id, parent_friendly
+    ):
+        """Initialise the counter at zero."""
+        super().__init__(
+            entry, entity_id, device_info, parent_object_id, parent_friendly
+        )
         self._attr_native_value: int = 0
 
     @callback

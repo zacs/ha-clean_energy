@@ -11,10 +11,10 @@ Architecture:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import voluptuous as vol
-
-from homeassistant.config_entries import ConfigEntry, SOURCE_DISCOVERY
+from homeassistant.config_entries import SOURCE_DISCOVERY, ConfigEntry
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_STATE_CHANGED,
@@ -30,7 +30,8 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -85,6 +86,7 @@ def _get_managed_entity_ids(hass: HomeAssistant) -> set[str]:
 # Hub: passive background watcher (one per HA instance)
 # ---------------------------------------------------------------------------
 
+
 class CleanEnergyHub:
     """Passively watches all energy sensors for spikes.
 
@@ -93,6 +95,7 @@ class CleanEnergyHub:
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
+        """Initialise the hub for a given Home Assistant instance."""
         self.hass = hass
         self._unsub: list = []
         # entity_id -> (last_good_value_native, timestamp)
@@ -134,9 +137,7 @@ class CleanEnergyHub:
                 continue
 
         self._unsub.append(
-            self.hass.bus.async_listen(
-                EVENT_STATE_CHANGED, self._handle_state_change
-            )
+            self.hass.bus.async_listen(EVENT_STATE_CHANGED, self._handle_state_change)
         )
         _LOGGER.info(
             "Clean Energy hub: watching all energy sensors passively "
@@ -217,33 +218,32 @@ class CleanEnergyHub:
             # — we deliberately do NOT touch the source's LTS, which keeps
             # the integration non-destructive.
             return
-        else:
-            # Unmanaged sensor: offer discovery (once per entity per session)
-            if entity_id not in self._discovered:
-                self._discovered.add(entity_id)
-                _LOGGER.info(
-                    "Clean Energy: spike detected on unmanaged sensor %s "
-                    "(%.3f → %.3f %s, implied %.1f kW). "
-                    "Creating discovery flow.",
-                    entity_id,
-                    prev_val,
-                    new_val,
-                    unit,
-                    implied_power_kw,
+        # Unmanaged sensor: offer discovery (once per entity per session)
+        if entity_id not in self._discovered:
+            self._discovered.add(entity_id)
+            _LOGGER.info(
+                "Clean Energy: spike detected on unmanaged sensor %s "
+                "(%.3f → %.3f %s, implied %.1f kW). "
+                "Creating discovery flow.",
+                entity_id,
+                prev_val,
+                new_val,
+                unit,
+                implied_power_kw,
+            )
+            self.hass.async_create_task(
+                self.hass.config_entries.flow.async_init(
+                    DOMAIN,
+                    context={"source": SOURCE_DISCOVERY},
+                    data={
+                        CONF_ENTITY_ID: entity_id,
+                        "spike_from": prev_val,
+                        "spike_to": new_val,
+                        "spike_unit": unit,
+                        "implied_power_kw": round(implied_power_kw, 1),
+                    },
                 )
-                self.hass.async_create_task(
-                    self.hass.config_entries.flow.async_init(
-                        DOMAIN,
-                        context={"source": SOURCE_DISCOVERY},
-                        data={
-                            CONF_ENTITY_ID: entity_id,
-                            "spike_from": prev_val,
-                            "spike_to": new_val,
-                            "spike_unit": unit,
-                            "implied_power_kw": round(implied_power_kw, 1),
-                        },
-                    )
-                )
+            )
 
         # Do NOT update last_reading - keep pre-spike baseline
 
@@ -298,9 +298,7 @@ class CleanEnergyHub:
 # Service: monitor a sensor on demand (no need to wait for a spike)
 # ---------------------------------------------------------------------------
 
-MONITOR_SENSOR_SCHEMA = vol.Schema(
-    {vol.Required(CONF_ENTITY_ID): cv.entity_id}
-)
+MONITOR_SENSOR_SCHEMA = vol.Schema({vol.Required(CONF_ENTITY_ID): cv.entity_id})
 
 
 async def _async_handle_monitor_sensor(
@@ -316,9 +314,7 @@ async def _async_handle_monitor_sensor(
     # Validate the entity is a total_increasing energy sensor.
     state = hass.states.get(entity_id)
     if state is None:
-        raise ServiceValidationError(
-            f"Entity {entity_id} does not exist"
-        )
+        raise ServiceValidationError(f"Entity {entity_id} does not exist")
     if not _is_energy_sensor(state):
         raise ServiceValidationError(
             f"Entity {entity_id} is not a total_increasing energy sensor "
@@ -351,16 +347,12 @@ async def _async_handle_monitor_sensor(
     )
 
     if result.get("type") == "create_entry":
-        _LOGGER.info(
-            "Clean Energy: now monitoring %s (added via service)", entity_id
-        )
+        _LOGGER.info("Clean Energy: now monitoring %s (added via service)", entity_id)
         return {"entity_id": entity_id, "status": "added"}
 
     # Flow returned a form or aborted - surface a useful error.
     reason = result.get("reason") or result.get("errors") or result.get("type")
-    raise ServiceValidationError(
-        f"Could not start monitoring {entity_id}: {reason}"
-    )
+    raise ServiceValidationError(f"Could not start monitoring {entity_id}: {reason}")
 
 
 @callback
@@ -385,6 +377,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
 # Entry setup / teardown
 # ---------------------------------------------------------------------------
 
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a Clean Energy config entry.
 
@@ -404,6 +397,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if hass.is_running:
             hub.start()
         else:
+
             async def _start_hub(event: Event) -> None:
                 hub.start()
 

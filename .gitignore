@@ -1,0 +1,121 @@
+# =====================================================================
+# Python
+# =====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Translations
+*.mo
+*.pot
+
+# =====================================================================
+# Virtual environments
+# =====================================================================
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# =====================================================================
+# Editors / IDEs
+# =====================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+.spyderproject
+.spyproject
+.ropeproject
+
+# =====================================================================
+# OS junk
+# =====================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =====================================================================
+# Home Assistant local dev artifacts
+# =====================================================================
+config/
+.HA_VERSION
+home-assistant.log*
+home-assistant_v2.db*
+*.db-shm
+*.db-wal
+secrets.yaml
+.storage/
+
+# =====================================================================
+# Project / tooling
+# =====================================================================
+.claude/
+.envrc
+.direnv/
+.env
+.env.local
+*.local

@@ -2,7 +2,7 @@
 
 A Home Assistant custom component that filters anomalous spikes out of energy sensors.
 
-_Disclosure: Viibe-coded. Sorry._
+_Disclosure: Vibe-coded, sorry. Lots of debugging and testing though._
 
 ## The problem
 
@@ -28,7 +28,7 @@ For each approved sensor `sensor.foo`, Clean Energy creates one user-facing enti
 
 | Entity suffix | Name | Type | Description |
 | --- | --- | --- | --- |
-| `_clean` | *Foo (Clean)* | Energy (kWh, total increasing) | The replacement entity to use in the Energy Dashboard. Mirrors the source value, but holds flat across detected spikes. The source's prior hourly LTS history is backfilled into this entity at setup. |
+| `_clean` | *Foo (Clean)* | Energy (kWh, total increasing) | The replacement entity to use in the Energy Dashboard. Mirrors the source value, but holds flat across detected spikes. The source's prior hourly history is backfilled into this entity at setup. |
 | `_last_spike` | *Last Spike* | Timestamp | When the most recent spike on this sensor was detected and filtered. |
 | `_last_spike_size` | *Last Spike Size* | Energy (kWh) | Size (kWh implied) of the most recent filtered spike. |
 | `_energy_removed` | *Energy Removed* | Energy (kWh, total increasing) | Cumulative kWh suppressed from this sensor by all filtering. |
@@ -38,11 +38,11 @@ For each approved sensor `sensor.foo`, Clean Energy creates one user-facing enti
 
 Clean Energy is **non-destructive**. It does not modify the source sensor's state, history, or Long-Term Statistics. The original entity continues to report whatever it reports — spikes and all — and its raw state history will still show those spikes.
 
-What changes is that you now also have a `_clean` companion entity whose values, history, and LTS are spike-free going forward. To benefit, **swap your Energy Dashboard source from `sensor.foo` to `sensor.foo_clean`**. (Settings → Dashboards → Energy → edit your grid/individual source.)
+What changes is that you now also have a `_clean` companion entity whose values, history, and long-term statistics (LTS) are spike-free going forward. To benefit, **swap your Energy Dashboard source from `sensor.foo` to `sensor.foo_clean`**. (Settings → Dashboards → Energy → edit your grid/individual source.)
 
 **Backfill caveat:** the historical LTS rows that get copied to the clean entity are exactly what the source already had — spikes included. The clean entity gives you spike-free *future* data with continuous historical context. If you'd rather start fresh, just don't swap the dashboard until enough clean history has accumulated, or delete the backfilled statistics for the clean entity from Developer Tools → Statistics.
 
-**Latency:** the clean entity reflects the filter decision in real time — there's no LTS-correction delay. A spike on the source produces no change on `_clean`; a normal reading is mirrored immediately.
+**Latency:** the clean entity reflects the filter decision in real time. A spike on the source produces no change on `_clean`; a normal reading is mirrored immediately.
 
 ## Setup
 
@@ -67,7 +67,7 @@ To manually add a sensor: go to **Add Integration → Clean Energy** again and s
 
 ## Adding a sensor manually (without waiting for a spike)
 
-By default, sensors are added to monitoring via the discovery flow when the passive watcher catches a spike. If you already know a sensor is flaky and don't want to wait, you can add it manually in two ways:
+By default, sensors are suggested for monitoring via the discovery flow when the component catches a spike. If you already know a sensor is flaky and don't want to wait, you can add it manually in two ways:
 
 **From the UI:** go to **Settings → Devices & Services → Add Integration → Clean Energy** and pick the sensor from the dropdown. (The first time you add the integration this configures the global threshold; subsequent runs let you add specific sensors.)
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -25,7 +24,8 @@ from .const import CONF_ENTITY_ID, CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW, DOMA
 
 def _is_energy_sensor(hass, entity_id: str) -> bool:
     """Check if an entity is a total_increasing energy sensor."""
-    from . import ENERGY_UNITS
+    # Lazy import to avoid a circular dependency with ``__init__``.
+    from . import ENERGY_UNITS  # noqa: PLC0415
 
     state = hass.states.get(entity_id)
     if state is None:
@@ -53,6 +53,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     def __init__(self) -> None:
+        """Initialise the config flow."""
         self._discovery_data: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
@@ -117,7 +118,8 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         # Build list of available energy sensors (not already managed)
         managed = _managed_entity_ids(self.hass)
-        from . import ENERGY_UNITS
+        # Lazy import to avoid a circular dependency with ``__init__``.
+        from . import ENERGY_UNITS  # noqa: PLC0415
 
         available = sorted(
             s.entity_id
@@ -134,9 +136,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_ENTITY_ID): vol.In(available)}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_ENTITY_ID): vol.In(available)}),
             errors=errors,
         )
 
@@ -236,9 +236,7 @@ class CleanEnergyOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_MAX_POWER_KW, default=current): vol.Coerce(
-                        float
-                    ),
+                    vol.Required(CONF_MAX_POWER_KW, default=current): vol.Coerce(float),
                 }
             ),
         )
