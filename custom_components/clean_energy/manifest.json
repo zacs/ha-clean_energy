@@ -3,10 +3,10 @@
   "name": "Clean Energy",
   "codeowners": ["@zacs"],
   "config_flow": true,
-  "documentation": "https://github.com/zacs/ha-clean_energy",
-  "issue_tracker": "https://github.com/zacs/ha-clean_energy/issues",
-  "iot_class": "local_push",
-  "version": "0.1.0",
   "dependencies": ["recorder"],
-  "integration_type": "service"
+  "documentation": "https://github.com/zacs/ha-clean_energy",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/zacs/ha-clean_energy/issues",
+  "version": "0.1.0"
 }
