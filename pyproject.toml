@@ -1,6 +1,6 @@
 [project]
 name = "clean_energy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Clean Energy Home Assistant integration."
 requires-python = ">=3.13"
 
