@@ -18,9 +18,11 @@ Some energy sensors (especially cheaper smart plugs and meters) occasionally rep
 
 4. **Per-sensor config entries**: Each approved sensor appears as its own entry under the Clean Energy integration. You can add sensors manually or accept discovery prompts.
 
-5. **A parallel “clean” entity, not LTS surgery**: For each approved sensor `sensor.foo`, Clean Energy creates a parallel `sensor.foo_clean` that mirrors the source's value but holds flat across spikes. The source entity is left **completely untouched** (no LTS adjustments, no history rewrites). You point the Energy Dashboard at the clean entity instead.
+5. **A parallel “clean” entity**: For each approved sensor `sensor.foo`, Clean Energy creates a parallel `sensor.foo_clean` that mirrors the source's value, minus an accumulated offset of all the bogus jumps it has observed. The source entity is left **completely untouched**. You point the Energy Dashboard at the clean entity instead.
 
-6. **History backfill**: When the clean entity is first created, the source's existing hourly Long-Term Statistics history is copied over so the dashboard retains continuity when you swap.
+6. **Permanent spikes are handled**: Flaky meters often spike *permanently* — the meter jumps to a bogus value and keeps incrementing from there. Each detected spike is added to a per-sensor offset that's subtracted from every future reading. Normal real-world increments on top of a post-spike source are still tracked. The offset only clears when the source itself resets (e.g. a Z-Wave manual meter reset).
+
+7. **History backfill**: When the clean entity is first created, the source's existing hourly Long-Term Statistics history is copied over so the dashboard retains continuity when you swap.
 
 ## Sensors
 
@@ -28,7 +30,7 @@ For each approved sensor `sensor.foo`, Clean Energy creates one user-facing enti
 
 | Entity suffix | Name | Type | Description |
 | --- | --- | --- | --- |
-| `_clean` | *Foo (Clean)* | Energy (kWh, total increasing) | The replacement entity to use in the Energy Dashboard. Mirrors the source value, but holds flat across detected spikes. The source's prior hourly history is backfilled into this entity at setup. |
+| `_clean` | *Foo (Clean)* | Energy (kWh, total increasing) | The replacement entity to use in the Energy Dashboard. Mirrors the source value with all detected spikes subtracted as a running offset. Exposes the current offset and last source value as attributes for debugging. The source's prior hourly history is backfilled into this entity at setup. |
 | `_last_spike` | *Last Spike* | Timestamp | When the most recent spike on this sensor was detected and filtered. |
 | `_last_spike_size` | *Last Spike Size* | Energy (kWh) | Size (kWh implied) of the most recent filtered spike. |
 | `_energy_removed` | *Energy Removed* | Energy (kWh, total increasing) | Cumulative kWh suppressed from this sensor by all filtering. |
@@ -42,7 +44,7 @@ What changes is that you now also have a `_clean` companion entity whose values,
 
 **Backfill caveat:** the historical LTS rows that get copied to the clean entity are exactly what the source already had — spikes included. The clean entity gives you spike-free *future* data with continuous historical context. If you'd rather start fresh, just don't swap the dashboard until enough clean history has accumulated, or delete the backfilled statistics for the clean entity from Developer Tools → Statistics.
 
-**Latency:** the clean entity reflects the filter decision in real time. A spike on the source produces no change on `_clean`; a normal reading is mirrored immediately.
+**Latency:** the clean entity reflects the filter decision in real time. A spike on the source is suppressed immediately (added to the offset); a normal reading is mirrored immediately.
 
 ## Setup
 

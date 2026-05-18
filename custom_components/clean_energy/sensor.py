@@ -218,6 +218,7 @@ async def _backfill_history(
         "name": f"{parent_friendly} (Clean)",
         "source": "recorder",
         "statistic_id": target_id,
+        "unit_class": "energy",
         "unit_of_measurement": unit,
     }
 
@@ -248,16 +249,27 @@ async def _backfill_history(
 class CleanFilterSensor(SensorEntity):
     """A ``total_increasing`` energy sensor that mirrors the source, sans spikes.
 
-    Algorithm per source state change:
-      * If the source dropped (likely a real ``total_increasing`` reset, e.g.
-        a meter rollover or device restart), adopt the new value as our
-        baseline so the recorder will detect our cycle reset cleanly too.
-      * If the implied power between the previous good value and the new
-        value exceeds the configured threshold, hold our emitted state at
-        the previous good value (don't update). Subsequent ticks compare
-        against that same baseline, so a multi-tick spike-and-revert is
-        absorbed in full.
-      * Otherwise, emit the new value and advance the baseline.
+    Real flaky meters typically spike *permanently*: the meter reports a
+    bogus value once, then keeps reporting from that bogus value forever
+    (monotonically increasing on top of it). The only way to clear it is a
+    hardware reset.
+
+    To handle that, the filter is an **offset accumulator**:
+
+    * We track the last raw source value we saw (``_last_source``) and a
+      cumulative offset (``_offset``) representing how much bogus energy
+      we've suppressed from the source over its lifetime.
+    * The emitted value is always ``source - offset``.
+    * When a new source reading implies a power draw above the threshold
+      between ticks (i.e. an impossibly large jump in too little time), we
+      treat the jump as bogus and add it to ``_offset``. The emitted value
+      stays put.
+    * Subsequent normal increments from the (now-elevated) source are still
+      mirrored: ``_offset`` keeps the spike subtracted but small real
+      increments on top of it are passed through.
+    * If the source ever drops (``total_increasing`` reset - e.g. a manual
+      Z-Wave meter reset), we treat it as a genuine reset, zero the offset,
+      and adopt the new value.
     """
 
     _attr_has_entity_name = False
@@ -281,11 +293,11 @@ class CleanFilterSensor(SensorEntity):
         self._attr_name = f"{parent_friendly} (Clean)"
         if device_info:
             self._attr_device_info = device_info
-        self._last_good_value: float | None = None
-        self._last_good_time: datetime | None = None
+        self._last_source: float | None = None
+        self._last_source_time: datetime | None = None
+        self._offset: float = 0.0
         self._native: float | None = None
         self._unit: str = UnitOfEnergy.KILO_WATT_HOUR
-        self._spike_active: bool = False
 
     @property
     def native_value(self) -> float | None:
@@ -297,6 +309,18 @@ class CleanFilterSensor(SensorEntity):
         """Return the unit of measurement, mirrored from the source."""
         return self._unit
 
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Expose internal filter state for debugging."""
+        return {
+            "source_entity": self._source_id,
+            "last_source_value": self._last_source,
+            "offset_kwh": round(self._offset, 3),
+            "last_source_time": (
+                self._last_source_time.isoformat() if self._last_source_time else None
+            ),
+        }
+
     async def async_added_to_hass(self) -> None:
         """Seed from the source's current state and start tracking changes."""
         source = self.hass.states.get(self._source_id)
@@ -306,8 +330,8 @@ class CleanFilterSensor(SensorEntity):
             except (ValueError, TypeError):
                 value = None
             if value is not None:
-                self._last_good_value = value
-                self._last_good_time = source.last_changed or dt_util.utcnow()
+                self._last_source = value
+                self._last_source_time = source.last_changed or dt_util.utcnow()
                 self._native = value
                 self._unit = source.attributes.get(
                     "unit_of_measurement", UnitOfEnergy.KILO_WATT_HOUR
@@ -337,58 +361,80 @@ class CleanFilterSensor(SensorEntity):
 
         now = new_state.last_changed or dt_util.utcnow()
 
-        if self._last_good_value is None or self._last_good_time is None:
-            self._last_good_value = new_val
-            self._last_good_time = now
-            self._native = new_val
+        # First reading: just seed.
+        if self._last_source is None or self._last_source_time is None:
+            self._last_source = new_val
+            self._last_source_time = now
+            self._native = new_val - self._offset
             self.async_write_ha_state()
             return
 
-        diff = new_val - self._last_good_value
+        diff = new_val - self._last_source
 
         if diff < 0:
-            # Genuine total_increasing reset on the source. Adopt the new
-            # baseline and let the recorder treat it as our reset too.
-            self._last_good_value = new_val
-            self._last_good_time = now
+            # Genuine total_increasing reset on the source (e.g. a manual
+            # Z-Wave meter reset). Drop any accumulated offset and adopt
+            # the new value as the new starting point. The recorder will
+            # see our state drop too and treat it as our reset.
+            _LOGGER.info(
+                "Clean Energy: source %s reset (%.3f -> %.3f %s); "
+                "clearing accumulated offset of %.3f kWh.",
+                self._source_id,
+                self._last_source,
+                new_val,
+                unit,
+                self._offset,
+            )
+            self._offset = 0.0
+            self._last_source = new_val
+            self._last_source_time = now
             self._native = new_val
-            self._spike_active = False
             self.async_write_ha_state()
             return
 
-        elapsed = max((now - self._last_good_time).total_seconds(), MIN_ELAPSED_SECONDS)
+        elapsed = max(
+            (now - self._last_source_time).total_seconds(), MIN_ELAPSED_SECONDS
+        )
         jump_kwh = diff * factor
         implied_kw = jump_kwh / (elapsed / 3600.0)
         threshold_kw = _hub_max_power_kw(self.hass)
 
         if implied_kw > threshold_kw:
-            # Spike: hold our emitted state. Fire the diagnostic signal once
-            # per spike *event* (not once per tick during a multi-tick spike).
-            if not self._spike_active:
-                self._spike_active = True
-                _LOGGER.info(
-                    "Clean Energy: filtered spike on %s (%.3f → %.3f %s, "
-                    "implied %.1f kW > %.0f kW limit)",
-                    self._source_id,
-                    self._last_good_value,
-                    new_val,
-                    unit,
-                    implied_kw,
-                    threshold_kw,
-                )
-                async_dispatcher_send(
-                    self.hass,
-                    f"{SIGNAL_SPIKE_CORRECTED}_{self._source_id}",
-                    jump_kwh,
-                    now,
-                )
+            # Spike: suppress the jump by adding it to the offset. The
+            # emitted value stays where it was; future small increments
+            # on top of the new (elevated) source level will still pass
+            # through normally because we compare each new reading
+            # against _last_source.
+            _LOGGER.warning(
+                "Clean Energy: filtered spike on %s "
+                "(%.3f -> %.3f %s, implied %.1f kW > %.0f kW limit); "
+                "suppressing %.3f kWh (total offset now %.3f kWh).",
+                self._source_id,
+                self._last_source,
+                new_val,
+                unit,
+                implied_kw,
+                threshold_kw,
+                jump_kwh,
+                self._offset + jump_kwh,
+            )
+            self._offset += jump_kwh
+            self._last_source = new_val
+            self._last_source_time = now
+            self._native = new_val - self._offset
+            async_dispatcher_send(
+                self.hass,
+                f"{SIGNAL_SPIKE_CORRECTED}_{self._source_id}",
+                jump_kwh,
+                now,
+            )
+            self.async_write_ha_state()
             return
 
         # Normal reading.
-        self._last_good_value = new_val
-        self._last_good_time = now
-        self._native = new_val
-        self._spike_active = False
+        self._last_source = new_val
+        self._last_source_time = now
+        self._native = new_val - self._offset
         self.async_write_ha_state()
 
 

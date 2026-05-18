@@ -1,4 +1,4 @@
-"""Unit tests for the CleanFilterSensor spike filter algorithm.
+"""Unit tests for the CleanFilterSensor offset-accumulator algorithm.
 
 These tests avoid the full config-entry setup pipeline and exercise the
 state-change handler directly. The algorithm is the part that matters for
@@ -71,14 +71,14 @@ async def test_first_reading_seeds_baseline(
     inst._handle_source_change(_state_change_event(100.0, t0))
 
     assert inst.native_value == 100.0
-    assert inst._last_good_value == 100.0
-    assert inst._spike_active is False
+    assert inst._last_source == 100.0
+    assert inst._offset == 0.0
 
 
 async def test_normal_increment_is_passed_through(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """A normal sub-threshold increase advances the baseline."""
+    """A normal sub-threshold increase advances the emitted value."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
     inst._handle_source_change(_state_change_event(100.0, t0))
@@ -86,47 +86,73 @@ async def test_normal_increment_is_passed_through(
     inst._handle_source_change(_state_change_event(101.0, t0 + timedelta(hours=1)))
 
     assert inst.native_value == 101.0
-    assert inst._last_good_value == 101.0
-    assert inst._spike_active is False
+    assert inst._last_source == 101.0
+    assert inst._offset == 0.0
 
 
-async def test_obvious_spike_is_held(
+async def test_permanent_spike_is_subtracted_via_offset(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """A jump implying >> threshold kW must hold the emitted state flat."""
+    """A massive jump goes into the offset; the emitted value stays put."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
-    inst._handle_source_change(_state_change_event(100.0, t0))
-    # 5000 kWh in 30s implies ~600,000 kW. Definitely a spike.
-    inst._handle_source_change(_state_change_event(5100.0, t0 + timedelta(seconds=30)))
+    inst._handle_source_change(_state_change_event(0.74, t0))
+    # 3583+ kWh in 60s implies ~215,000 kW. Definitely a spike.
+    inst._handle_source_change(_state_change_event(3584.0, t0 + timedelta(seconds=60)))
 
-    assert inst.native_value == 100.0  # held
-    assert inst._last_good_value == 100.0  # baseline NOT advanced
-    assert inst._spike_active is True
+    assert inst.native_value == pytest.approx(0.74)
+    assert inst._last_source == 3584.0
+    assert inst._offset == pytest.approx(3583.26)
 
 
-async def test_spike_then_revert_recovers_cleanly(
+async def test_normal_increments_after_permanent_spike_still_track(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """After a spike-and-revert, normal readings resume tracking."""
+    """After a spike is absorbed into offset, small real increments pass through.
+
+    This is the core scenario: the meter spikes permanently to a bogus value
+    and then continues monotonically increasing. The clean entity should keep
+    tracking those real-world increments without re-tripping the filter.
+    """
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
-    inst._handle_source_change(_state_change_event(100.0, t0))
-    inst._handle_source_change(_state_change_event(5100.0, t0 + timedelta(seconds=30)))
-    # Source returns to a sane value: drop triggers the "real reset" branch.
-    inst._handle_source_change(_state_change_event(100.5, t0 + timedelta(seconds=60)))
+    inst._handle_source_change(_state_change_event(0.74, t0))
+    inst._handle_source_change(_state_change_event(3584.0, t0 + timedelta(seconds=60)))
 
-    assert inst.native_value == 100.5
-    assert inst._last_good_value == 100.5
-    assert inst._spike_active is False
+    # An hour later, the plug really did consume 0.1 kWh.
+    inst._handle_source_change(
+        _state_change_event(3584.1, t0 + timedelta(seconds=60) + timedelta(hours=1))
+    )
+    assert inst.native_value == pytest.approx(0.84)
+
+    # Another hour, another 0.2 kWh on top.
+    inst._handle_source_change(
+        _state_change_event(3584.3, t0 + timedelta(seconds=60) + timedelta(hours=2))
+    )
+    assert inst.native_value == pytest.approx(1.04)
+    assert inst._offset == pytest.approx(3583.26)
 
 
-async def test_multi_tick_spike_only_fires_dispatcher_once(
+async def test_repeated_spikes_keep_accumulating_offset(
+    hass: HomeAssistant, fixed_threshold: float
+) -> None:
+    """Multiple distinct spikes should each add to the cumulative offset."""
+    inst = _make_sensor(hass)
+    t0 = dt_util.utcnow()
+    inst._handle_source_change(_state_change_event(0.0, t0))
+    inst._handle_source_change(_state_change_event(1000.0, t0 + timedelta(seconds=60)))
+    inst._handle_source_change(_state_change_event(2500.0, t0 + timedelta(seconds=120)))
+
+    assert inst.native_value == pytest.approx(0.0)
+    assert inst._offset == pytest.approx(2500.0)
+
+
+async def test_each_spike_fires_dispatcher(
     hass: HomeAssistant,
     fixed_threshold: float,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A spike that persists across multiple ticks should fire once per event."""
+    """Each detected spike fires the dispatcher signal once with its jump size."""
     inst = _make_sensor(hass)
     sends: list[tuple] = []
     monkeypatch.setattr(
@@ -136,34 +162,43 @@ async def test_multi_tick_spike_only_fires_dispatcher_once(
     )
 
     t0 = dt_util.utcnow()
-    inst._handle_source_change(_state_change_event(100.0, t0))
-    inst._handle_source_change(_state_change_event(5100.0, t0 + timedelta(seconds=30)))
-    inst._handle_source_change(_state_change_event(5101.0, t0 + timedelta(seconds=60)))
-    inst._handle_source_change(_state_change_event(5102.0, t0 + timedelta(seconds=90)))
+    inst._handle_source_change(_state_change_event(0.0, t0))
+    inst._handle_source_change(_state_change_event(1000.0, t0 + timedelta(seconds=60)))
+    # A normal increment in between shouldn't fire.
+    inst._handle_source_change(_state_change_event(1000.5, t0 + timedelta(hours=1)))
+    inst._handle_source_change(
+        _state_change_event(2500.5, t0 + timedelta(hours=1, seconds=60))
+    )
 
-    assert len(sends) == 1
-    signal, _args = sends[0]
-    assert signal.endswith("_sensor.flaky")
+    assert len(sends) == 2
+    for signal, _args in sends:
+        assert signal.endswith("_sensor.flaky")
+    assert sends[0][1][0] == pytest.approx(1000.0)
+    assert sends[1][1][0] == pytest.approx(1500.0)
 
 
-async def test_real_reset_is_adopted(
+async def test_real_reset_clears_offset_and_adopts(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """A drop in the source (e.g. meter rollover) is adopted as new baseline."""
+    """A drop in the source (e.g. Z-Wave manual meter reset) clears the offset."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
-    inst._handle_source_change(_state_change_event(1000.0, t0))
-    inst._handle_source_change(_state_change_event(0.5, t0 + timedelta(hours=1)))
+    inst._handle_source_change(_state_change_event(0.0, t0))
+    inst._handle_source_change(_state_change_event(1000.0, t0 + timedelta(seconds=60)))
+    assert inst._offset == pytest.approx(1000.0)
 
-    assert inst.native_value == 0.5
-    assert inst._last_good_value == 0.5
-    assert inst._spike_active is False
+    # User issues a Z-Wave reset.
+    inst._handle_source_change(_state_change_event(0.0, t0 + timedelta(hours=1)))
+
+    assert inst.native_value == 0.0
+    assert inst._last_source == 0.0
+    assert inst._offset == 0.0
 
 
 async def test_unknown_source_state_is_ignored(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """`unknown` / `unavailable` source states must not perturb the baseline."""
+    """`unknown` / `unavailable` source states must not perturb anything."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
     inst._handle_source_change(_state_change_event(50.0, t0))
@@ -176,7 +211,8 @@ async def test_unknown_source_state_is_ignored(
     inst._handle_source_change(SimpleNamespace(data={"new_state": bad_state}))
 
     assert inst.native_value == 50.0
-    assert inst._last_good_value == 50.0
+    assert inst._last_source == 50.0
+    assert inst._offset == 0.0
 
 
 async def test_unknown_unit_is_ignored(
@@ -195,7 +231,7 @@ async def test_unknown_unit_is_ignored(
     inst._handle_source_change(SimpleNamespace(data={"new_state": weird}))
 
     assert inst.native_value == 50.0
-    assert inst._last_good_value == 50.0
+    assert inst._last_source == 50.0
 
 
 async def test_diagnostics_aggregate_dispatcher_signals(
