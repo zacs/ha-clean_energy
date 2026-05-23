@@ -3,19 +3,9 @@
     "step": {
       "user": {
         "title": "Clean Energy",
-        "description": "Monitors energy sensors for anomalous spikes and corrects long-term statistics. Set the maximum realistic power draw for any single sensor.",
+        "description": "Monitors energy sensors for anomalous spikes and corrects long-term statistics. Set the maximum realistic power draw for any single sensor. After install, additional sensors are added automatically when a spike is detected, or manually via the `clean_energy.monitor_sensor` service.",
         "data": {
           "max_power_kw": "Max realistic power draw (kW)"
-        },
-        "menu_options": {
-          "add_sensor": "Add a sensor to monitor"
-        }
-      },
-      "add_sensor": {
-        "title": "Add a sensor",
-        "description": "Pick an energy sensor to monitor for spikes.",
-        "data": {
-          "entity_id": "Energy sensor to monitor"
         }
       },
       "confirm": {
@@ -24,12 +14,11 @@
       }
     },
     "abort": {
-      "already_configured": "This sensor is already being monitored",
-      "no_sensors_available": "No unmonitored energy sensors found",
+      "already_configured": "Clean Energy is already set up",
+      "not_energy_sensor": "This entity is not a total_increasing energy sensor",
       "no_options": "Per-sensor entries have no configurable options"
     },
     "error": {
-      "already_monitored": "This sensor is already being monitored",
       "not_energy_sensor": "This entity is not a total_increasing energy sensor"
     }
   },

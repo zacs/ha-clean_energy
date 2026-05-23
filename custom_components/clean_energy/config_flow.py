@@ -1,9 +1,21 @@
 """Config flow for Clean Energy.
 
-Supports three entry points:
-1. User manually adds the integration (first time) - sets global threshold.
-2. User manually adds a specific sensor to monitor.
-3. Discovery flow when the hub detects a spike on an unmanaged sensor.
+Entry points:
+
+1. User adds the integration via the UI - creates the singleton hub entry
+   (one per HA instance, enforced via ``unique_id``). The hub then watches
+   all energy sensors passively for spikes.
+2. ``clean_energy.monitor_sensor`` service - manually adds a per-sensor
+   entry (used when you already know a sensor is flaky and don't want to
+   wait for the passive watcher to catch a spike).
+3. Discovery flow - the hub auto-proposes a per-sensor entry when it
+   observes a spike on an unmanaged sensor.
+
+Per-sensor entries are intentionally never offered from the "Add
+Integration" UI button. This avoids the trap where clicking the integration
+tile a second time forces the user into a sensor picker with no escape; the
+modern HA pattern (used by e.g. Battery Notes) is to keep the hub-add path
+hub-only and surface device adds through discovery or a dedicated flow.
 """
 
 from __future__ import annotations
@@ -19,7 +31,13 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 
-from .const import CONF_ENTITY_ID, CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW, DOMAIN
+from .const import (
+    CONF_ENTITY_ID,
+    CONF_MAX_POWER_KW,
+    DEFAULT_MAX_POWER_KW,
+    DOMAIN,
+    HUB_UNIQUE_ID,
+)
 
 
 def _is_energy_sensor(hass, entity_id: str) -> bool:
@@ -35,16 +53,6 @@ def _is_energy_sensor(hass, entity_id: str) -> bool:
         attrs.get("state_class") == "total_increasing"
         and attrs.get("unit_of_measurement", "") in ENERGY_UNITS
     )
-
-
-def _managed_entity_ids(hass) -> set[str]:
-    """Entity IDs that already have a config entry."""
-    managed = set()
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        eid = entry.data.get(CONF_ENTITY_ID)
-        if eid:
-            managed.add(eid)
-    return managed
 
 
 class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -65,33 +73,15 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle user-initiated setup.
 
-        On a fresh install (no hub entry yet) we show the threshold form and
-        create the hub. On subsequent invocations we present a menu so the
-        user can explicitly choose to add a sensor manually instead of being
-        force-routed into the sensor picker.
+        Clean Energy is a singleton hub: the "Add Integration" entry point
+        only ever creates the hub. Per-sensor monitoring is added via the
+        discovery flow (automatic on spike) or the
+        ``clean_energy.monitor_sensor`` service (manual).
         """
-        hub_exists = any(
-            not entry.data.get(CONF_ENTITY_ID)
-            for entry in self.hass.config_entries.async_entries(DOMAIN)
-        )
-        if not hub_exists:
-            return await self._async_step_setup_hub(user_input)
+        # Enforce singleton hub via unique_id.
+        await self.async_set_unique_id(HUB_UNIQUE_ID)
+        self._abort_if_unique_id_configured()
 
-        return self.async_show_menu(
-            step_id="user",
-            menu_options=["add_sensor"],
-        )
-
-    async def async_step_add_sensor(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Menu entry point for manually adding a sensor to monitor."""
-        return await self._async_step_add_sensor(user_input)
-
-    async def _async_step_setup_hub(
-        self, user_input: dict[str, Any] | None
-    ) -> ConfigFlowResult:
-        """Create the initial hub entry."""
         if user_input is not None:
             return self.async_create_entry(
                 title="Clean Energy",
@@ -111,50 +101,32 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={},
         )
 
-    async def _async_step_add_sensor(
-        self, user_input: dict[str, Any] | None
+    # ------------------------------------------------------------------
+    # Service-initiated flow: manual sensor add via ``monitor_sensor``
+    # ------------------------------------------------------------------
+
+    async def async_step_monitor_service(
+        self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Let user pick an energy sensor to monitor."""
-        errors = {}
-        if user_input is not None:
-            entity_id = user_input[CONF_ENTITY_ID]
-            if entity_id in _managed_entity_ids(self.hass):
-                errors[CONF_ENTITY_ID] = "already_monitored"
-            elif not _is_energy_sensor(self.hass, entity_id):
-                errors[CONF_ENTITY_ID] = "not_energy_sensor"
-            else:
-                # Use entity_id as unique_id to prevent duplicates
-                await self.async_set_unique_id(entity_id)
-                self._abort_if_unique_id_configured()
+        """Add a sensor entry from the ``clean_energy.monitor_sensor`` service.
 
-                name = self._friendly_name(entity_id)
-                return self.async_create_entry(
-                    title=name,
-                    data={CONF_ENTITY_ID: entity_id},
-                )
+        ``user_input`` is always supplied by the service caller; no form is
+        shown. We still validate and set a unique_id so duplicates abort
+        cleanly.
+        """
+        assert user_input is not None
+        entity_id = user_input[CONF_ENTITY_ID]
 
-        # Build list of available energy sensors (not already managed)
-        managed = _managed_entity_ids(self.hass)
-        # Lazy import to avoid a circular dependency with ``__init__``.
-        from . import ENERGY_UNITS  # noqa: PLC0415
+        if not _is_energy_sensor(self.hass, entity_id):
+            return self.async_abort(reason="not_energy_sensor")
 
-        available = sorted(
-            s.entity_id
-            for s in self.hass.states.async_all()
-            if (
-                s.attributes.get("state_class") == "total_increasing"
-                and s.attributes.get("unit_of_measurement", "") in ENERGY_UNITS
-                and s.entity_id not in managed
-            )
-        )
+        await self.async_set_unique_id(entity_id)
+        self._abort_if_unique_id_configured()
 
-        if not available:
-            return self.async_abort(reason="no_sensors_available")
-
-        return self.async_show_form(
-            step_id="add_sensor",
-            data_schema=vol.Schema({vol.Required(CONF_ENTITY_ID): vol.In(available)}),
-            errors=errors,
+        name = self._friendly_name(entity_id)
+        return self.async_create_entry(
+            title=name,
+            data={CONF_ENTITY_ID: entity_id},
         )
 
     # ------------------------------------------------------------------

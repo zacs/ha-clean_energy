@@ -337,12 +337,12 @@ async def _async_handle_monitor_sensor(
             f"Entity {entity_id} is already being monitored by Clean Energy"
         )
 
-    # Trigger a user-source flow with the entity_id pre-filled. The flow's
-    # _async_step_add_sensor will validate again, set the unique_id, and
-    # create the config entry.
+    # Trigger the dedicated service-source flow with the entity_id pre-filled.
+    # The flow's ``async_step_monitor_service`` validates, sets the unique_id,
+    # and creates the per-sensor config entry.
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
-        context={"source": "user"},
+        context={"source": "monitor_service"},
         data={CONF_ENTITY_ID: entity_id},
     )
 

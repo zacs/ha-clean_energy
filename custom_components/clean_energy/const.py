@@ -9,6 +9,10 @@ SIGNAL_SPIKE_CORRECTED = f"{DOMAIN}_spike_corrected"
 
 SERVICE_MONITOR_SENSOR = "monitor_sensor"
 
+# Stable unique_id for the singleton hub config entry. Any per-sensor entries
+# use the source entity_id as their unique_id.
+HUB_UNIQUE_ID = f"{DOMAIN}_hub"
+
 # Marker stored in entry.data once we've copied the source sensor's existing
 # Long-Term Statistics into the new clean entity.
 BACKFILL_DONE_KEY = "backfill_done"
