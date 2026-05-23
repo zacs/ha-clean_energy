@@ -63,12 +63,29 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle user-initiated setup."""
-        existing = self.hass.config_entries.async_entries(DOMAIN)
-        if not existing:
-            # First time: create the "hub" entry with global threshold
+        """Handle user-initiated setup.
+
+        On a fresh install (no hub entry yet) we show the threshold form and
+        create the hub. On subsequent invocations we present a menu so the
+        user can explicitly choose to add a sensor manually instead of being
+        force-routed into the sensor picker.
+        """
+        hub_exists = any(
+            not entry.data.get(CONF_ENTITY_ID)
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+        )
+        if not hub_exists:
             return await self._async_step_setup_hub(user_input)
-        # Already set up: let user add a specific sensor
+
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=["add_sensor"],
+        )
+
+    async def async_step_add_sensor(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Menu entry point for manually adding a sensor to monitor."""
         return await self._async_step_add_sensor(user_input)
 
     async def _async_step_setup_hub(
@@ -135,7 +152,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="no_sensors_available")
 
         return self.async_show_form(
-            step_id="user",
+            step_id="add_sensor",
             data_schema=vol.Schema({vol.Required(CONF_ENTITY_ID): vol.In(available)}),
             errors=errors,
         )
