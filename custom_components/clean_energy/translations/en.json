@@ -15,8 +15,7 @@
     },
     "abort": {
       "already_configured": "Clean Energy is already set up",
-      "not_energy_sensor": "This entity is not a total_increasing energy sensor",
-      "no_options": "Per-sensor entries have no configurable options"
+      "not_energy_sensor": "This entity is not a total_increasing energy sensor"
     },
     "error": {
       "not_energy_sensor": "This entity is not a total_increasing energy sensor"
@@ -28,6 +27,13 @@
         "title": "Clean Energy Options",
         "data": {
           "max_power_kw": "Max realistic power draw (kW)"
+        }
+      },
+      "sensor": {
+        "title": "Repair Clean sensor",
+        "description": "Adjust the offset (in the source sensor's unit) that the Clean entity for **{entity_id}** subtracts from the source. If the spike was missed at discovery time and the Clean sensor is currently mirroring the bogus value, set this to (current_source_reading − last_known_good_reading) and save.",
+        "data": {
+          "initial_offset": "Offset to subtract from source"
         }
       }
     }

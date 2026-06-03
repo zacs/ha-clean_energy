@@ -33,6 +33,7 @@ from homeassistant.core import callback
 
 from .const import (
     CONF_ENTITY_ID,
+    CONF_INITIAL_OFFSET,
     CONF_MAX_POWER_KW,
     DEFAULT_MAX_POWER_KW,
     DOMAIN,
@@ -156,13 +157,27 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         entity_id = self._discovery_data[CONF_ENTITY_ID]
 
         if user_input is not None:
+            # Compute the initial offset to bake into the entry: the
+            # difference between the source's current value and the
+            # pre-spike baseline the hub captured. This is what the filter
+            # sensor needs to subtract on seed so the Clean value starts at
+            # the correct (pre-spike) level instead of mirroring the spike.
+            pre_spike = self._discovery_data.get("spike_from")
+            current_state = self.hass.states.get(entity_id)
+            initial_offset = 0.0
+            if pre_spike is not None and current_state is not None:
+                try:
+                    current_val = float(current_state.state)
+                    initial_offset = max(0.0, current_val - float(pre_spike))
+                except (ValueError, TypeError):
+                    initial_offset = 0.0
+
             name = self._friendly_name(entity_id)
             return self.async_create_entry(
                 title=name,
                 data={
                     CONF_ENTITY_ID: entity_id,
-                    "spike_jump_kwh": self._discovery_data.get("spike_jump_kwh", 0),
-                    "spike_time": self._discovery_data.get("spike_time"),
+                    CONF_INITIAL_OFFSET: initial_offset,
                 },
             )
 
@@ -206,15 +221,21 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class CleanEnergyOptionsFlow(OptionsFlow):
-    """Options flow - only shown on the hub entry (no entity_id in data)."""
+    """Options flow.
+
+    * Hub entry (no entity_id): edit the global max-power threshold.
+    * Per-sensor entry: edit the initial offset, which is what the Clean
+      sensor subtracts from the source. Useful for repairing an entry
+      whose spike was missed at discovery time (so the Clean sensor is
+      currently mirroring the bogus spiked value).
+    """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage options."""
-        # Only the hub entry (no entity_id) has configurable options
         if self.config_entry.data.get(CONF_ENTITY_ID):
-            return self.async_abort(reason="no_options")
+            return await self.async_step_sensor()
 
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
@@ -228,4 +249,42 @@ class CleanEnergyOptionsFlow(OptionsFlow):
                     vol.Required(CONF_MAX_POWER_KW, default=current): vol.Coerce(float),
                 }
             ),
+        )
+
+    async def async_step_sensor(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit per-sensor options (initial offset).
+
+        We store the offset on ``entry.data`` rather than ``entry.options``
+        because the filter sensor reads it once at seed time; persisting it
+        in ``data`` keeps the read path simple and avoids an options/data
+        precedence question on every state change.
+        """
+        entry = self.config_entry
+        if user_input is not None:
+            new_offset = float(user_input[CONF_INITIAL_OFFSET])
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_INITIAL_OFFSET: new_offset},
+            )
+            # Reload so the filter sensor re-seeds with the new offset.
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(entry.entry_id)
+            )
+            return self.async_create_entry(title="", data={})
+
+        current = float(entry.data.get(CONF_INITIAL_OFFSET, 0.0))
+        return self.async_show_form(
+            step_id="sensor",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_INITIAL_OFFSET, default=current): vol.Coerce(
+                        float
+                    ),
+                }
+            ),
+            description_placeholders={
+                "entity_id": entry.data.get(CONF_ENTITY_ID, ""),
+            },
         )

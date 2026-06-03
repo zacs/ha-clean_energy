@@ -4,6 +4,12 @@ DOMAIN = "clean_energy"
 
 CONF_MAX_POWER_KW = "max_power_kw"
 CONF_ENTITY_ID = "entity_id"
+# Cumulative kWh (in the source's native unit) to subtract from the source
+# when emitting the Clean value. Set at entry-creation time from the
+# pre-spike baseline captured by the hub; can be edited via the options flow
+# to repair an entry whose spike was missed (e.g. because the integration
+# was installed *after* the spike already baked into the source).
+CONF_INITIAL_OFFSET = "initial_offset"
 
 SIGNAL_SPIKE_CORRECTED = f"{DOMAIN}_spike_corrected"
 

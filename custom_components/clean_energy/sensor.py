@@ -53,6 +53,7 @@ from homeassistant.util import dt as dt_util
 from .const import (
     BACKFILL_DONE_KEY,
     CONF_ENTITY_ID,
+    CONF_INITIAL_OFFSET,
     CONF_MAX_POWER_KW,
     DEFAULT_MAX_POWER_KW,
     DOMAIN,
@@ -295,7 +296,11 @@ class CleanFilterSensor(SensorEntity):
             self._attr_device_info = device_info
         self._last_source: float | None = None
         self._last_source_time: datetime | None = None
-        self._offset: float = 0.0
+        # Initial offset (in the source's native unit) captured at entry
+        # creation time. Without this, a sensor whose spike *triggered*
+        # discovery would be seeded from the already-spiked source state
+        # and the Clean value would mirror the spike one-for-one.
+        self._offset: float = float(entry.data.get(CONF_INITIAL_OFFSET, 0.0))
         self._native: float | None = None
         self._unit: str = UnitOfEnergy.KILO_WATT_HOUR
 
@@ -332,7 +337,10 @@ class CleanFilterSensor(SensorEntity):
             if value is not None:
                 self._last_source = value
                 self._last_source_time = source.last_changed or dt_util.utcnow()
-                self._native = value
+                # Apply the persisted offset on seed. Clamp to >= 0 so a
+                # mis-configured offset never produces a negative reading
+                # (which would also break TOTAL_INCREASING semantics).
+                self._native = max(0.0, value - self._offset)
                 self._unit = source.attributes.get(
                     "unit_of_measurement", UnitOfEnergy.KILO_WATT_HOUR
                 )
