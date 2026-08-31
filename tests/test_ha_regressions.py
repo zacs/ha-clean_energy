@@ -3,10 +3,11 @@
 Each test here corresponds to a line in the reported log:
 
 * the clean sensor reporting a negative ``total_increasing`` state, which
-  makes the recorder discard every statistics row for it (so the Energy
-  Dashboard shows nothing at all);
+  the recorder refuses to accumulate — it compiles the hour with a ``sum``
+  of 0, so the Energy Dashboard reads zero for as long as the state stays
+  negative;
 * the ``async_device_info_to_link_from_entity`` deprecation, which now
-  always returns None;
+  always returns None, detaching every entity from its device;
 * a 0.512 kWh jump being filtered as a 61 kW "spike".
 """
 
@@ -120,6 +121,11 @@ async def test_reverted_spike_does_not_go_negative(
     The entry was created by discovery while the source was spiked, so a
     huge ``initial_offset`` was baked in. The source then reverted to its
     true value, but the offset was still subtracted from every reading.
+
+    The recorder will not accumulate a negative ``total_increasing`` sensor:
+    the first negative reading short-circuits past its reset detection and
+    becomes both the zero point and the last state, so the hour compiles
+    with a ``sum`` of 0 and the Energy Dashboard reads zero.
     """
     inst = _make_sensor(hass, data={CONF_INITIAL_OFFSET: 14316560.0})
     _set_source(hass, 6.07)
