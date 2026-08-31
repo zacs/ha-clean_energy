@@ -32,8 +32,7 @@ def _make_sensor(hass: HomeAssistant) -> CleanFilterSensor:
     inst = CleanFilterSensor(
         entry=entry,
         source_id="sensor.flaky",
-        device_info=None,
-        parent_object_id="flaky",
+        device_entry=None,
         parent_friendly="Flaky",
     )
     inst.hass = hass
@@ -72,7 +71,7 @@ async def test_first_reading_seeds_baseline(
 
     assert inst.native_value == 100.0
     assert inst._last_source == 100.0
-    assert inst._offset == 0.0
+    assert inst._suppressed == 0.0
 
 
 async def test_normal_increment_is_passed_through(
@@ -87,13 +86,13 @@ async def test_normal_increment_is_passed_through(
 
     assert inst.native_value == 101.0
     assert inst._last_source == 101.0
-    assert inst._offset == 0.0
+    assert inst._suppressed == 0.0
 
 
-async def test_permanent_spike_is_subtracted_via_offset(
+async def test_permanent_spike_is_not_counted(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """A massive jump goes into the offset; the emitted value stays put."""
+    """A massive jump is refused; the emitted value stays put."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
     inst._handle_source_change(_state_change_event(0.74, t0))
@@ -102,7 +101,7 @@ async def test_permanent_spike_is_subtracted_via_offset(
 
     assert inst.native_value == pytest.approx(0.74)
     assert inst._last_source == 3584.0
-    assert inst._offset == pytest.approx(3583.26)
+    assert inst._suppressed == pytest.approx(3583.26)
 
 
 async def test_normal_increments_after_permanent_spike_still_track(
@@ -130,13 +129,13 @@ async def test_normal_increments_after_permanent_spike_still_track(
         _state_change_event(3584.3, t0 + timedelta(seconds=60) + timedelta(hours=2))
     )
     assert inst.native_value == pytest.approx(1.04)
-    assert inst._offset == pytest.approx(3583.26)
+    assert inst._suppressed == pytest.approx(3583.26)
 
 
-async def test_repeated_spikes_keep_accumulating_offset(
+async def test_repeated_spikes_keep_accumulating_tally(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """Multiple distinct spikes should each add to the cumulative offset."""
+    """Multiple distinct spikes should each add to the suppressed tally."""
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
     inst._handle_source_change(_state_change_event(0.0, t0))
@@ -144,7 +143,7 @@ async def test_repeated_spikes_keep_accumulating_offset(
     inst._handle_source_change(_state_change_event(2500.0, t0 + timedelta(seconds=120)))
 
     assert inst.native_value == pytest.approx(0.0)
-    assert inst._offset == pytest.approx(2500.0)
+    assert inst._suppressed == pytest.approx(2500.0)
 
 
 async def test_each_spike_fires_dispatcher(
@@ -177,22 +176,32 @@ async def test_each_spike_fires_dispatcher(
     assert sends[1][1][0] == pytest.approx(1500.0)
 
 
-async def test_real_reset_clears_offset_and_adopts(
+async def test_real_reset_re_anchors_without_rewinding(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """A drop in the source (e.g. Z-Wave manual meter reset) clears the offset."""
+    """A drop in the source (e.g. Z-Wave manual meter reset) re-anchors us.
+
+    We only ever added increments we accepted, so a source reset has nothing
+    to unwind: the clean total holds and we adopt the new source level as the
+    baseline for the next comparison.
+    """
     inst = _make_sensor(hass)
     t0 = dt_util.utcnow()
     inst._handle_source_change(_state_change_event(0.0, t0))
     inst._handle_source_change(_state_change_event(1000.0, t0 + timedelta(seconds=60)))
-    assert inst._offset == pytest.approx(1000.0)
+    assert inst._suppressed == pytest.approx(1000.0)
 
     # User issues a Z-Wave reset.
     inst._handle_source_change(_state_change_event(0.0, t0 + timedelta(hours=1)))
 
     assert inst.native_value == 0.0
     assert inst._last_source == 0.0
-    assert inst._offset == 0.0
+    # The suppressed tally is a lifetime counter, not part of the arithmetic.
+    assert inst._suppressed == pytest.approx(1000.0)
+
+    # Real consumption after the reset still counts.
+    inst._handle_source_change(_state_change_event(0.4, t0 + timedelta(hours=2)))
+    assert inst.native_value == pytest.approx(0.4)
 
 
 async def test_unknown_source_state_is_ignored(
@@ -212,7 +221,7 @@ async def test_unknown_source_state_is_ignored(
 
     assert inst.native_value == 50.0
     assert inst._last_source == 50.0
-    assert inst._offset == 0.0
+    assert inst._suppressed == 0.0
 
 
 async def test_unknown_unit_is_ignored(
@@ -239,7 +248,7 @@ async def test_diagnostics_aggregate_dispatcher_signals(
 ) -> None:
     """The diagnostic sensors should accumulate state from spike signals."""
     entry = SimpleNamespace(entry_id="diag_entry", data={}, options={})
-    common = (entry, "sensor.flaky", None, "flaky", "Flaky")
+    common = (entry, "sensor.flaky", None, "Flaky")
 
     last_time = LastSpikeTimeSensor(*common)
     last_size = LastSpikeSizeSensor(*common)
