@@ -143,7 +143,8 @@ async def test_clean_sensor_is_linked_to_the_source_device(
     _set_source(hass, 10.0)
 
     await _setup(hass, _hub(hass))
-    await _setup(hass, _sensor_entry())
+    ours = _sensor_entry()
+    await _setup(hass, ours)
 
     clean = entity_registry.async_get("sensor.flaky_energy_clean")
     assert clean is not None
@@ -159,12 +160,12 @@ async def test_clean_sensor_is_linked_to_the_source_device(
         assert entity.device_info is None
         assert entity.device_entry is not None and entity.device_entry.id == device.id
 
-    # Linking must not pull the source's device into our config entry.
-    assert source_entry.entry_id in device_registry.async_get(device.id).config_entries
-    assert (
-        _sensor_entry().entry_id
-        not in device_registry.async_get(device.id).config_entries
-    )
+    # Linking must not pull the source's device into our config entry: that
+    # implicit adoption is what Home Assistant deprecated, and it makes the
+    # device list Clean Energy among its integrations.
+    config_entries = device_registry.async_get(device.id).config_entries
+    assert source_entry.entry_id in config_entries
+    assert ours.entry_id not in config_entries
 
 
 async def test_clean_sensor_never_reports_a_negative_state(
@@ -222,3 +223,80 @@ async def test_unload_removes_entities(recorder_mock, hass: HomeAssistant) -> No
     # Registry entities keep a restored placeholder state after unload.
     clean = hass.states.get("sensor.flaky_energy_clean")
     assert clean.state == STATE_UNAVAILABLE
+
+
+async def test_recovers_from_the_pre_fix_device_adoption(
+    recorder_mock,
+    hass: HomeAssistant,
+) -> None:
+    """Reproduce and repair the state a pre-0.3.0 install upgrades into.
+
+    The old code linked entities by handing over a DeviceInfo carrying the
+    source device's identifiers, which implicitly added our config entry to
+    that device. On 2026.8 the helper that built it always returns None, so
+    the entities end up attached to no device at all while the stale link
+    remains — the device page still lists Clean Energy but shows "This device
+    has no entities".
+    """
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+
+    source_entry = MockConfigEntry(domain="zwave_js")
+    source_entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=source_entry.entry_id,
+        identifiers={("zwave_js", "basement-stairwell")},
+        name="In Basement Stairwell",
+        manufacturer="Inovelli",
+        model="VZW31-SN",
+    )
+    entity_registry.async_get_or_create(
+        "sensor",
+        "zwave_js",
+        "flaky-energy",
+        suggested_object_id="flaky_energy",
+        device_id=device.id,
+        config_entry=source_entry,
+    )
+    _set_source(hass, 10.0)
+
+    await _setup(hass, _hub(hass))
+    ours = _sensor_entry()
+    ours.add_to_hass(hass)
+
+    # The leftovers: our entry adopted onto the device, and orphaned entities.
+    device_registry.async_update_device(device.id, add_config_entry_id=ours.entry_id)
+    for suffix in (
+        "clean",
+        "last_spike",
+        "last_spike_size",
+        "energy_removed",
+        "spike_count",
+    ):
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"{ours.entry_id}_{suffix}",
+            suggested_object_id=f"flaky_energy_{suffix}",
+            device_id=None,
+            config_entry=ours,
+        )
+    assert ours.entry_id in device_registry.async_get(device.id).config_entries
+
+    assert await hass.config_entries.async_setup(ours.entry_id)
+    await hass.async_block_till_done()
+
+    # Entities are back on the device...
+    ours_entities = [
+        e for e in entity_registry.entities.values() if e.platform == DOMAIN
+    ]
+    assert len(ours_entities) == 5
+    assert all(e.device_id == device.id for e in ours_entities), [
+        (e.entity_id, e.device_id) for e in ours_entities
+    ]
+
+    # ...and the stale adoption is gone, so the device stops advertising us.
+    surviving = device_registry.async_get(device.id)
+    assert surviving is not None
+    assert ours.entry_id not in surviving.config_entries
+    assert source_entry.entry_id in surviving.config_entries

@@ -40,6 +40,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
 from homeassistant.core import Event, HomeAssistant, callback, split_entity_id
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device import async_entity_id_to_device
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.dispatcher import (
@@ -105,6 +106,34 @@ def _parent_friendly_name(hass: HomeAssistant, entity_id: str) -> str:
     return split_entity_id(entity_id)[1].replace("_", " ").title()
 
 
+@callback
+def _async_unlink_adopted_devices(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop this config entry from any device it was implicitly added to.
+
+    Clean Energy owns no devices — it only puts its entities on the source's
+    device. But handing the entity platform a DeviceInfo carrying that
+    device's identifiers (what the old, now-deprecated helper produced)
+    implicitly added this config entry to the device. The device then lists
+    Clean Energy among its integrations forever, and Home Assistant, which
+    cannot represent a single-config-entry device that way, splits it.
+
+    Assigning ``device_entry`` needs no such link, so anything left over from
+    the old approach is stale and gets removed here. Run before the entities
+    are added, so that adding them re-establishes the correct device.
+    """
+    device_registry = dr.async_get(hass)
+    for device in list(
+        device_registry.devices.get_devices_for_config_entry_id(entry.entry_id)
+    ):
+        _LOGGER.info(
+            "Clean Energy: removing stale config entry link from device %s",
+            device.name or device.id,
+        )
+        device_registry.async_update_device(
+            device.id, remove_config_entry_id=entry.entry_id
+        )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -123,6 +152,7 @@ async def async_setup_entry(
     # put an entity on someone else's device is to assign ``device_entry``, which
     # the entity platform honours when ``device_info`` is None.
     device_entry = async_entity_id_to_device(hass, entity_id)
+    _async_unlink_adopted_devices(hass, entry)
     parent_friendly = _parent_friendly_name(hass, entity_id)
 
     async_add_entities(

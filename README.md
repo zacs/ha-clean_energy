@@ -48,7 +48,7 @@ What changes is that you now also have a `_clean` companion entity whose values,
 
 **Latency:** the clean entity reflects the filter decision in real time. A spike on the source is dropped immediately; a normal reading is counted immediately.
 
-**Never negative:** the clean entity is a `total_increasing` sensor, and Home Assistant's recorder discards *every* statistics row for a `total_increasing` sensor whose state is negative — which leaves the Energy Dashboard blank rather than merely wrong. The accumulator can only move by increments it accepted, so it cannot go negative.
+**Never negative:** the clean entity is a `total_increasing` sensor, and Home Assistant's recorder refuses to accumulate a negative one — it raises on every reading after the first and compiles the hour with a `sum` of 0, so the Energy Dashboard reads zero for as long as the state stays negative. The accumulator can only move by increments it accepted, so it cannot go negative.
 
 ## Setup
 
@@ -93,9 +93,13 @@ The only setting is **Max realistic power draw (kW)** — the maximum instantane
 
 A reading has to fail *both* tests to count as a spike: it must imply more than this power draw, **and** be a jump of at least 1 kWh. The rate test alone is too eager, because readings less than 30 seconds apart are all measured against a 30-second floor — so any jump above roughly 0.4 kWh would imply more than 50 kW. Meters that batch up a reading after an outage legitimately do that, and a genuinely broken meter's spike is orders of magnitude larger than 1 kWh.
 
-## Recovering a clean sensor with bad history
+## Recovering after upgrading from a pre-0.3.0 install
 
-If a clean entity recorded bad values before you upgraded (versions before 0.3.0 could drive it negative, which makes the recorder drop its statistics entirely), the code fix stops it happening again but does not rewrite what was already recorded. To clear the bad rows:
+**Entities missing from the device page.** Versions before 0.3.0 attached their entities to the source's device by handing Home Assistant a `DeviceInfo` carrying that device's identifiers, which implicitly added the Clean Energy config entry to the device. Home Assistant deprecated that, and the helper behind it now always returns `None` — so on 2026.8 the entities end up attached to no device at all, while the device keeps listing Clean Energy and reports "This device has no entities".
+
+The entities are not deleted, only detached: you can still find them under **Settings → Devices & Services → Clean Energy → entities**, and any dashboard cards or automations referencing them keep working. Upgrading reattaches them to the device and clears the stale link.
+
+**Bad recorded history.** If a clean entity recorded negative values before you upgraded, the code fix stops it happening again but does not rewrite what was already recorded. To clear the bad rows:
 
 1. Go to **Developer Tools → Statistics**.
 2. Find the `_clean` entity and delete its long-term statistics.
