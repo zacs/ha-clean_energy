@@ -40,6 +40,7 @@ from .const import (
     DEFAULT_MAX_POWER_KW,
     DOMAIN,
     MIN_ELAPSED_SECONDS,
+    MIN_SPIKE_KWH,
     SERVICE_MONITOR_SENSOR,
 )
 
@@ -105,8 +106,16 @@ class CleanEnergyHub:
 
     @property
     def max_power_kw(self) -> float:
-        """Global threshold - uses the first config entry's value, or default."""
+        """Global threshold, read from the hub entry.
+
+        Only the hub entry carries the threshold option; per-sensor entries
+        have none. Returning the *first* entry's option regardless meant that
+        whenever a per-sensor entry happened to sort first we silently fell
+        back to the default and ignored the configured value.
+        """
         for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if entry.data.get(CONF_ENTITY_ID):
+                continue
             return entry.options.get(CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW)
         return DEFAULT_MAX_POWER_KW
 
@@ -204,8 +213,11 @@ class CleanEnergyHub:
         elapsed = max((now - prev_time).total_seconds(), MIN_ELAPSED_SECONDS)
         implied_power_kw = jump_kwh / (elapsed / 3600.0)
 
-        if implied_power_kw <= self.max_power_kw:
-            # Normal reading
+        if jump_kwh < MIN_SPIKE_KWH or implied_power_kw <= self.max_power_kw:
+            # Normal reading. Both tests have to fail it: an implausible rate
+            # alone catches meters that merely batch up a reading (after an
+            # outage, or a Home Assistant restart), because MIN_ELAPSED_SECONDS
+            # floors the denominator.
             self._last_readings[entity_id] = (new_val, now)
             return
 
