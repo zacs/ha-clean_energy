@@ -1,7 +1,8 @@
 [project]
 name = "clean_energy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Clean Energy Home Assistant integration."
+license = "MIT"
 requires-python = ">=3.13"
 
 [tool.ruff]
