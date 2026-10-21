@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.util import dt as dt_util
 
 from custom_components.clean_energy import sensor as sensor_module
@@ -42,21 +42,28 @@ def _make_sensor(hass: HomeAssistant) -> CleanFilterSensor:
     return inst
 
 
-def _state_change_event(value: float, when: datetime) -> SimpleNamespace:
+def _state_change_event(
+    value: float, when: datetime, old_state: State | None = None
+) -> SimpleNamespace:
     """Build a minimal state-change event for the filter to consume."""
-    new_state = SimpleNamespace(
-        state=str(value),
-        attributes={"unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR},
+    new_state = State(
+        "sensor.flaky",
+        str(value),
+        {"unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR},
         last_changed=when,
+        last_reported=when,
+        last_updated=when,
     )
-    return SimpleNamespace(data={"new_state": new_state})
+    return SimpleNamespace(data={"new_state": new_state, "old_state": old_state})
 
 
 @pytest.fixture
 def fixed_threshold(monkeypatch: pytest.MonkeyPatch) -> float:
     """Pin the hub threshold to 50 kW regardless of config-entry state."""
     threshold = 50.0
-    monkeypatch.setattr(sensor_module, "_hub_max_power_kw", lambda _hass: threshold)
+    monkeypatch.setattr(
+        sensor_module, "max_power_kw", lambda _hass, _entry=None: threshold
+    )
     return threshold
 
 
@@ -217,7 +224,9 @@ async def test_unknown_source_state_is_ignored(
         attributes={"unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR},
         last_changed=t0 + timedelta(seconds=30),
     )
-    inst._handle_source_change(SimpleNamespace(data={"new_state": bad_state}))
+    inst._handle_source_change(
+        SimpleNamespace(data={"new_state": bad_state, "old_state": None})
+    )
 
     assert inst.native_value == 50.0
     assert inst._last_source == 50.0
@@ -237,7 +246,9 @@ async def test_unknown_unit_is_ignored(
         attributes={"unit_of_measurement": "foo"},
         last_changed=t0 + timedelta(seconds=30),
     )
-    inst._handle_source_change(SimpleNamespace(data={"new_state": weird}))
+    inst._handle_source_change(
+        SimpleNamespace(data={"new_state": weird, "old_state": None})
+    )
 
     assert inst.native_value == 50.0
     assert inst._last_source == 50.0
@@ -272,3 +283,84 @@ async def test_diagnostics_aggregate_dispatcher_signals(
     assert last_size.native_value == 2.5
     assert total.native_value == pytest.approx(4.0)
     assert count.native_value == 2
+
+
+async def test_idle_device_glitch_is_caught_when_the_meter_re_reports(
+    hass: HomeAssistant, fixed_threshold: float
+) -> None:
+    """A lamp idle for 14 h jumps 655.35 kWh: under 50 kW over 14 h.
+
+    Measured from when the value first appeared, the jump looks plausible and
+    used to be counted. The meter re-reported its unchanged value a minute
+    before the jump, so it had a minute, not 14 hours.
+    """
+    inst = _make_sensor(hass)
+    t0 = dt_util.utcnow()
+    inst._handle_source_change(_state_change_event(38.0, t0))
+
+    now = t0 + timedelta(hours=14)
+    previous = State(
+        "sensor.flaky",
+        "38.0",
+        {"unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR},
+        last_changed=t0,
+        last_reported=now - timedelta(minutes=1),
+        last_updated=now - timedelta(minutes=1),
+    )
+    inst._handle_source_change(_state_change_event(38.0 + 655.35, now, previous))
+
+    assert inst.native_value == pytest.approx(38.0)
+    assert inst._suppressed == pytest.approx(655.35)
+
+
+async def test_idle_device_without_re_reports_needs_its_own_ceiling(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no re-reports, only a per-sensor ceiling can tell a lamp from a house."""
+    monkeypatch.setattr(sensor_module, "max_power_kw", lambda _hass, _entry=None: 3.0)
+    inst = _make_sensor(hass)
+    t0 = dt_util.utcnow()
+    inst._handle_source_change(_state_change_event(38.0, t0))
+    inst._handle_source_change(
+        _state_change_event(38.0 + 655.35, t0 + timedelta(hours=14))
+    )
+
+    assert inst.native_value == pytest.approx(38.0)
+
+
+async def test_gigajoule_meter_is_tracked(
+    hass: HomeAssistant, fixed_threshold: float
+) -> None:
+    """The hub accepted GJ meters, but the filter used to ignore every reading."""
+    inst = _make_sensor(hass)
+    t0 = dt_util.utcnow()
+    for value, when in ((1.0, t0), (1.01, t0 + timedelta(hours=1))):
+        state = State(
+            "sensor.flaky",
+            str(value),
+            {"unit_of_measurement": "GJ"},
+            last_changed=when,
+            last_reported=when,
+            last_updated=when,
+        )
+        inst._handle_source_change(
+            SimpleNamespace(data={"new_state": state, "old_state": None})
+        )
+
+    assert inst.native_unit_of_measurement == "GJ"
+    assert inst.native_value == pytest.approx(1.01)
+
+
+async def test_nan_reading_does_not_poison_the_total(
+    hass: HomeAssistant, fixed_threshold: float
+) -> None:
+    inst = _make_sensor(hass)
+    t0 = dt_util.utcnow()
+    inst._handle_source_change(_state_change_event(10.0, t0))
+    nan = State("sensor.flaky", "nan", {"unit_of_measurement": "kWh"})
+    inst._handle_source_change(
+        SimpleNamespace(data={"new_state": nan, "old_state": None})
+    )
+    inst._handle_source_change(_state_change_event(10.5, t0 + timedelta(hours=1)))
+
+    assert inst.native_value == pytest.approx(10.5)

@@ -1,14 +1,14 @@
 [project]
 name = "clean_energy"
-version = "0.3.0"
+version = "0.4.0"
 description = "Clean Energy Home Assistant integration."
 license = "MIT"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 
 [tool.ruff]
 required-version = ">=0.13.1"
 line-length = 88
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [

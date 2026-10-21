@@ -19,14 +19,16 @@ from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.restore_state import RestoredExtraData
 from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.clean_energy import sensor as sensor_module
 from custom_components.clean_energy.const import (
+    CONF_ENTITY_ID,
     CONF_INITIAL_OFFSET,
-    STORE_APPLIED_OFFSET,
+    HISTORY_DONE_KEY,
     STORE_LAST_SOURCE,
     STORE_LAST_SOURCE_TS,
     STORE_NATIVE,
@@ -48,8 +50,17 @@ def _make_sensor(
     data: dict | None = None,
     restored: dict | None = None,
 ) -> CleanFilterSensor:
-    """Build a filter sensor with optional entry data and restored state."""
-    entry = SimpleNamespace(entry_id="test_entry", data=data or {}, options={})
+    """Build a filter sensor with optional entry data and restored state.
+
+    The entry is marked as having its history derived already, so these
+    tests exercise seeding and filtering without starting a rebuild.
+    """
+    entry = MockConfigEntry(
+        domain="clean_energy",
+        data={CONF_ENTITY_ID: SOURCE_ID, HISTORY_DONE_KEY: True, **(data or {})},
+        unique_id=SOURCE_ID,
+    )
+    entry.add_to_hass(hass)
     inst = CleanFilterSensor(
         entry=entry,
         source_id=SOURCE_ID,
@@ -62,10 +73,6 @@ def _make_sensor(
     inst.async_on_remove = MagicMock()
     inst.async_get_last_extra_data = _async_return(
         RestoredExtraData(restored) if restored is not None else None
-    )
-    # The entry is a stand-in, so keep the config-entry write side-effect free.
-    inst._clear_configured_offset = MagicMock(
-        side_effect=lambda: setattr(inst, "_configured_offset", 0.0)
     )
     return inst
 
@@ -83,11 +90,15 @@ def _event(value: float, when: datetime, unit: str = UnitOfEnergy.KILO_WATT_HOUR
     """Build a minimal state-change event."""
     return SimpleNamespace(
         data={
-            "new_state": SimpleNamespace(
-                state=str(value),
-                attributes={"unit_of_measurement": unit},
+            "new_state": State(
+                SOURCE_ID,
+                str(value),
+                {"unit_of_measurement": unit},
                 last_changed=when,
-            )
+                last_reported=when,
+                last_updated=when,
+            ),
+            "old_state": None,
         }
     )
 
@@ -104,7 +115,7 @@ def _set_source(hass: HomeAssistant, value: float, unit: str = "kWh") -> None:
 @pytest.fixture
 def fixed_threshold(monkeypatch: pytest.MonkeyPatch) -> float:
     """Pin the hub threshold to 50 kW regardless of config-entry state."""
-    monkeypatch.setattr(sensor_module, "_hub_max_power_kw", lambda _hass: 50.0)
+    monkeypatch.setattr(sensor_module, "max_power_kw", lambda _hass, _entry=None: 50.0)
     return 50.0
 
 
@@ -154,8 +165,8 @@ async def test_stale_offset_larger_than_source_is_discarded(
     await inst.async_added_to_hass()
 
     assert inst.native_value == pytest.approx(6.07)
-    assert inst._configured_offset == 0.0
-    inst._clear_configured_offset.assert_called_once()
+    # Scrubbed from the entry, so it can't come back on the next seed.
+    assert inst._entry.data[CONF_INITIAL_OFFSET] == 0.0
 
 
 async def test_valid_offset_is_still_applied(
@@ -169,7 +180,7 @@ async def test_valid_offset_is_still_applied(
     await inst.async_added_to_hass()
 
     assert inst.native_value == pytest.approx(0.74)
-    inst._clear_configured_offset.assert_not_called()
+    assert inst._entry.data[CONF_INITIAL_OFFSET] == pytest.approx(3583.26)
 
 
 async def test_value_never_decreases_across_a_reverting_spike(
@@ -212,7 +223,6 @@ async def test_state_survives_a_restart(
         STORE_LAST_SOURCE_TS: t0.isoformat(),
         STORE_SUPPRESSED: 3583.26,
         STORE_UNIT: UnitOfEnergy.KILO_WATT_HOUR,
-        STORE_APPLIED_OFFSET: 3583.26,
     }
     inst = _make_sensor(hass, data={CONF_INITIAL_OFFSET: 3583.26}, restored=restored)
     _set_source(hass, 3596.5)
@@ -229,19 +239,22 @@ async def test_state_survives_a_restart(
     assert inst.native_value == pytest.approx(12.6)
 
 
-async def test_editing_the_offset_forces_a_reseed(
+async def test_restored_state_wins_over_a_stored_offset(
     hass: HomeAssistant, fixed_threshold: float
 ) -> None:
-    """Changing the offset in the options flow is a request to re-seed.
+    """A stored offset never overrides the restored running total.
 
-    Otherwise the restored total would win and the repair would do nothing.
+    Before 0.4.0, editing the offset re-seeded the total in place. The
+    recorder counts any in-place change of a total as consumption (a drop
+    reads as a meter reset, adding the whole new value), so the "repair"
+    injected the very kind of spike this integration exists to remove.
+    Corrections now go through clean_energy.rebuild_history instead.
     """
     restored = {
         STORE_NATIVE: 5000.0,
         STORE_LAST_SOURCE: 5000.0,
         STORE_LAST_SOURCE_TS: dt_util.utcnow().isoformat(),
         STORE_SUPPRESSED: 0.0,
-        STORE_APPLIED_OFFSET: 0.0,
     }
     inst = _make_sensor(hass, data={CONF_INITIAL_OFFSET: 4900.0}, restored=restored)
     _set_source(hass, 5000.0)
@@ -249,7 +262,7 @@ async def test_editing_the_offset_forces_a_reseed(
 
     await inst.async_added_to_hass()
 
-    assert inst.native_value == pytest.approx(100.0)
+    assert inst.native_value == pytest.approx(5000.0)
 
 
 async def test_restart_gap_is_measured_from_the_restored_timestamp(
@@ -268,7 +281,6 @@ async def test_restart_gap_is_measured_from_the_restored_timestamp(
             STORE_LAST_SOURCE: 66.594,
             STORE_LAST_SOURCE_TS: t0.isoformat(),
             STORE_SUPPRESSED: 0.0,
-            STORE_APPLIED_OFFSET: 0.0,
         },
     )
     _set_source(hass, 66.594)

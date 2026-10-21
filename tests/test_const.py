@@ -31,8 +31,16 @@ def test_required_keys_exist() -> None:
         "CONF_ENTITY_ID",
         "SIGNAL_SPIKE_CORRECTED",
         "SERVICE_MONITOR_SENSOR",
-        "BACKFILL_DONE_KEY",
+        "SERVICE_REBUILD_HISTORY",
+        "HISTORY_DONE_KEY",
+        "LEGACY_BACKFILL_DONE_KEY",
         "DEFAULT_MAX_POWER_KW",
         "MIN_ELAPSED_SECONDS",
     ):
         assert hasattr(const, name), f"const.{name} is missing"
+
+
+def test_legacy_marker_keeps_its_stored_name() -> None:
+    """Entries written before 0.4.0 store this exact key; renaming it would
+    make every existing sensor look new and rewrite its history unasked."""
+    assert const.LEGACY_BACKFILL_DONE_KEY == "backfill_done"
