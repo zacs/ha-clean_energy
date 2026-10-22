@@ -13,3 +13,37 @@ monitor_sensor:
         entity:
           domain: sensor
           device_class: energy
+
+rebuild_history:
+  name: Rebuild history
+  description: >-
+    Re-derive a Clean sensor's long-term statistics from its source's, leaving
+    out impossible jumps, and correct its current value to match. Use once on
+    Clean sensors created before 0.4.0, whose history was copied with spikes
+    included. The statistics are replaced over the next few minutes.
+  target:
+    entity:
+      integration: clean_energy
+      domain: sensor
+      device_class: energy
+  fields:
+    offset:
+      name: Offset
+      description: >-
+        Optional. Energy (in the source's unit) known to be bogus in the
+        source's current reading, for a spike that predates its recorded
+        history. Overrides the value derived from history.
+      required: false
+      selector:
+        number:
+          min: 0
+          mode: box
+    force:
+      name: Force
+      description: >-
+        Rebuild even though the Clean sensor has statistics older than any
+        recorded for its source. Those older statistics are discarded.
+      required: false
+      default: false
+      selector:
+        boolean:

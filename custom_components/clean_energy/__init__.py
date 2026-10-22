@@ -14,15 +14,16 @@ import logging
 from datetime import datetime
 
 import voluptuous as vol
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.config_entries import SOURCE_DISCOVERY, ConfigEntry
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_STATE_CHANGED,
     Platform,
-    UnitOfEnergy,
 )
 from homeassistant.core import (
     Event,
+    EventStateChangedData,
     HomeAssistant,
     ServiceCall,
     ServiceResponse,
@@ -32,55 +33,44 @@ from homeassistant.core import (
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
-from homeassistant.util import dt as dt_util
+from homeassistant.helpers.device import async_entity_id_to_device_id
+from homeassistant.helpers.helper_integration import (
+    async_handle_source_entity_changes,
+    async_remove_helper_devices,
+)
+from homeassistant.helpers.service import async_register_platform_entity_service
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
+    ATTR_FORCE,
+    ATTR_OFFSET,
     CONF_ENTITY_ID,
-    CONF_MAX_POWER_KW,
-    DEFAULT_MAX_POWER_KW,
     DOMAIN,
-    MIN_ELAPSED_SECONDS,
-    MIN_SPIKE_KWH,
+    HUB_UNIQUE_ID,
     SERVICE_MONITOR_SENSOR,
+    SERVICE_REBUILD_HISTORY,
+    CleanEnergyFeature,
+)
+from .entries import managed_entity_ids, max_power_kw
+from .spike import (
+    confirmed_at,
+    implied_kw,
+    is_energy_sensor,
+    is_spike,
+    reading,
+    to_kwh,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR]
 
-# Conversion factors to kWh
-_TO_KWH: dict[str, float] = {
-    UnitOfEnergy.KILO_WATT_HOUR: 1.0,
-    UnitOfEnergy.WATT_HOUR: 0.001,
-    UnitOfEnergy.MEGA_WATT_HOUR: 1000.0,
-    "kWh": 1.0,
-    "Wh": 0.001,
-    "MWh": 1000.0,
-    "GJ": 277.778,
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+REBUILD_HISTORY_SCHEMA: dict = {
+    vol.Optional(ATTR_OFFSET): vol.All(vol.Coerce(float), vol.Range(min=0)),
+    vol.Optional(ATTR_FORCE, default=False): cv.boolean,
 }
-
-ENERGY_UNITS = set(_TO_KWH.keys())
-
-
-def _is_energy_sensor(state) -> bool:
-    """Check if a state object represents a total_increasing energy sensor."""
-    if state is None:
-        return False
-    attrs = state.attributes
-    return (
-        attrs.get("state_class") == "total_increasing"
-        and attrs.get("unit_of_measurement", "") in ENERGY_UNITS
-    )
-
-
-def _get_managed_entity_ids(hass: HomeAssistant) -> set[str]:
-    """Return entity_ids that have an approved config entry."""
-    managed = set()
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        eid = entry.data.get(CONF_ENTITY_ID)
-        if eid:
-            managed.add(eid)
-    return managed
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +81,8 @@ def _get_managed_entity_ids(hass: HomeAssistant) -> set[str]:
 class CleanEnergyHub:
     """Passively watches all energy sensors for spikes.
 
-    - For managed sensors (have a config entry): apply statistics correction.
-    - For unmanaged sensors: fire a discovery flow so the user can approve.
+    Sensors with a monitoring entry are filtered by their own clean sensor;
+    for the rest, a spike offers a discovery flow so the user can approve.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -106,18 +96,8 @@ class CleanEnergyHub:
 
     @property
     def max_power_kw(self) -> float:
-        """Global threshold, read from the hub entry.
-
-        Only the hub entry carries the threshold option; per-sensor entries
-        have none. Returning the *first* entry's option regardless meant that
-        whenever a per-sensor entry happened to sort first we silently fell
-        back to the default and ignored the configured value.
-        """
-        for entry in self.hass.config_entries.async_entries(DOMAIN):
-            if entry.data.get(CONF_ENTITY_ID):
-                continue
-            return entry.options.get(CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW)
-        return DEFAULT_MAX_POWER_KW
+        """Global threshold, read from the hub entry."""
+        return max_power_kw(self.hass)
 
     def start(self) -> None:
         """Begin listening to all energy sensors.
@@ -129,21 +109,14 @@ class CleanEnergyHub:
         """
         # Seed last_readings with currently-known energy sensors so we have a
         # baseline for spike detection from the first observed change.
-        now = dt_util.utcnow()
         seeded = 0
         for state in self.hass.states.async_all():
-            if not _is_energy_sensor(state):
+            if not is_energy_sensor(state):
                 continue
-            if state.state in ("unknown", "unavailable", None):
+            if (current := reading(state)) is None:
                 continue
-            try:
-                self._last_readings[state.entity_id] = (
-                    float(state.state),
-                    state.last_changed or now,
-                )
-                seeded += 1
-            except (ValueError, TypeError):
-                continue
+            self._last_readings[state.entity_id] = (current[0], state.last_changed)
+            seeded += 1
 
         self._unsub.append(
             self.hass.bus.async_listen(EVENT_STATE_CHANGED, self._handle_state_change)
@@ -161,19 +134,17 @@ class CleanEnergyHub:
         self._unsub.clear()
 
     @callback
-    def _handle_state_change(self, event: Event) -> None:
+    def _handle_state_change(self, event: Event[EventStateChangedData]) -> None:
         """Evaluate a state change for spike."""
-        new_state = event.data.get("new_state")
+        new_state = event.data["new_state"]
 
         # Filter to total_increasing energy sensors only. Doing this here
         # (rather than at subscription time) means newly created sensors are
         # picked up automatically.
-        if not _is_energy_sensor(new_state):
+        if not is_energy_sensor(new_state) or (current := reading(new_state)) is None:
             return
-
-        if new_state.state in ("unknown", "unavailable"):
-            return
-
+        assert new_state is not None  # is_energy_sensor() checked
+        new_val, unit = current
         entity_id = event.data["entity_id"]
 
         # Never monitor our own diagnostic sensors. Without this guard, the
@@ -185,17 +156,7 @@ class CleanEnergyHub:
         if registered is not None and registered.platform == DOMAIN:
             return
 
-        try:
-            new_val = float(new_state.state)
-        except (ValueError, TypeError):
-            return
-
-        unit = new_state.attributes.get("unit_of_measurement", "kWh")
-        factor = _TO_KWH.get(unit)
-        if factor is None:
-            return
-
-        now = new_state.last_changed or dt_util.utcnow()
+        now = new_state.last_changed
 
         prev = self._last_readings.get(entity_id)
         if prev is None:
@@ -209,30 +170,23 @@ class CleanEnergyHub:
             self._last_readings[entity_id] = (new_val, now)
             return
 
-        jump_kwh = jump * factor
-        elapsed = max((now - prev_time).total_seconds(), MIN_ELAPSED_SECONDS)
-        implied_power_kw = jump_kwh / (elapsed / 3600.0)
-
-        if jump_kwh < MIN_SPIKE_KWH or implied_power_kw <= self.max_power_kw:
-            # Normal reading. Both tests have to fail it: an implausible rate
-            # alone catches meters that merely batch up a reading (after an
-            # outage, or a Home Assistant restart), because MIN_ELAPSED_SECONDS
-            # floors the denominator.
+        since = confirmed_at(event.data["old_state"], prev_val, unit, prev_time)
+        elapsed = (now - since).total_seconds()
+        jump_kwh = to_kwh(jump, unit)
+        if not is_spike(jump_kwh, elapsed, self.max_power_kw):
             self._last_readings[entity_id] = (new_val, now)
             return
 
         # --- Spike detected ---
-        managed = _get_managed_entity_ids(self.hass)
-
-        if entity_id in managed:
-            # Approved sensor: the per-entity CleanFilterSensor handles
-            # filtering at the entity level. The hub does nothing here
-            # — we deliberately do NOT touch the source's LTS, which keeps
-            # the integration non-destructive.
+        if entity_id in managed_entity_ids(self.hass):
+            # Approved sensor: its clean sensor filters it. The hub does
+            # nothing — we deliberately do NOT touch the source's LTS, which
+            # keeps the integration non-destructive.
             return
         # Unmanaged sensor: offer discovery (once per entity per session)
         if entity_id not in self._discovered:
             self._discovered.add(entity_id)
+            implied = implied_kw(jump_kwh, elapsed)
             _LOGGER.info(
                 "Clean Energy: spike detected on unmanaged sensor %s "
                 "(%.3f → %.3f %s, implied %.1f kW). "
@@ -241,7 +195,7 @@ class CleanEnergyHub:
                 prev_val,
                 new_val,
                 unit,
-                implied_power_kw,
+                implied,
             )
             self.hass.async_create_task(
                 self.hass.config_entries.flow.async_init(
@@ -252,7 +206,7 @@ class CleanEnergyHub:
                         "spike_from": prev_val,
                         "spike_to": new_val,
                         "spike_unit": unit,
-                        "implied_power_kw": round(implied_power_kw, 1),
+                        "implied_power_kw": round(implied, 1),
                     },
                 )
             )
@@ -262,48 +216,6 @@ class CleanEnergyHub:
     def clear_discovery(self, entity_id: str) -> None:
         """Allow re-discovery if user ignores/dismisses the flow."""
         self._discovered.discard(entity_id)
-
-
-# ---------------------------------------------------------------------------
-# Statistics correction (deferred + persisted)
-#
-# `recorder.adjust_statistics` runs a single SQL UPDATE of the form
-#    UPDATE statistics SET sum = sum + adj WHERE start_ts >= start_time_ts
-# It does NOT persist the adjustment for rows written in the future. So if we
-# call it the moment we detect a spike, the 5-minute short-term row that
-# *contains* the spike has not been compiled yet (compilation runs at the
-# next 5-min boundary), so the UPDATE matches no rows, and when the row is
-# later inserted it carries the spike value untouched.
-#
-# Fortunately, hourly rows are not a separate problem: the recorder's hourly
-# compilation derives `sum` directly from the *last* short-term row in the
-# hour (see _compile_hourly_statistics in recorder/statistics.py). So if we
-# fix the spike's short-term row before the top-of-next-hour compilation
-# runs, the hourly row is born correct — no extra hour-long wait needed.
-#
-# So the fix is to defer the adjustment only until just after the next
-# 5-minute boundary (when the spike's short-term row is guaranteed to
-# exist), and pass `start_time = floor(spike_time, 5min)` so the spike's
-# own row is included in the UPDATE while pre-spike rows in the same hour
-# are not (otherwise the diff between rows would still show a spike).
-# Worst-case visible-error window in the Energy Dashboard: ~5½ minutes.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Statistics correction
-#
-# (Removed.) We used to issue `recorder.adjust_statistics` calls to patch
-# spikes out of the source sensor's Long-Term Statistics, but the recorder's
-# own `total_increasing` reset detection treats every spike-and-revert as a
-# completed cycle, baking the spike's value into the cumulative sum on the
-# next compilation pass and undoing any adjustment we make.
-#
-# Instead, the per-entity setup (see sensor.py) now creates a
-# CleanFilterSensor that mirrors the source's value with spikes held flat,
-# and copies the source's existing hourly LTS history into it. The Energy
-# Dashboard should be pointed at the clean entity. The source entity is
-# left completely untouched.
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +239,7 @@ async def _async_handle_monitor_sensor(
     state = hass.states.get(entity_id)
     if state is None:
         raise ServiceValidationError(f"Entity {entity_id} does not exist")
-    if not _is_energy_sensor(state):
+    if not is_energy_sensor(state):
         raise ServiceValidationError(
             f"Entity {entity_id} is not a total_increasing energy sensor "
             f"(state_class={state.attributes.get('state_class')!r}, "
@@ -344,7 +256,7 @@ async def _async_handle_monitor_sensor(
         )
 
     # Already monitored?
-    if entity_id in _get_managed_entity_ids(hass):
+    if entity_id in managed_entity_ids(hass):
         raise ServiceValidationError(
             f"Entity {entity_id} is already being monitored by Clean Energy"
         )
@@ -386,6 +298,26 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Service: rebuild a clean sensor's history
+# ---------------------------------------------------------------------------
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the entity services."""
+    async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_REBUILD_HISTORY,
+        entity_domain=SENSOR_DOMAIN,
+        schema=REBUILD_HISTORY_SCHEMA,
+        func="async_rebuild_history",
+        required_features=[CleanEnergyFeature.REBUILD_HISTORY],
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Entry setup / teardown
 # ---------------------------------------------------------------------------
 
@@ -394,7 +326,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a Clean Energy config entry.
 
     The first entry loaded also starts the hub (background watcher).
-    Per-entity entries just register themselves; the hub handles the rest.
     """
     hub: CleanEnergyHub | None = hass.data.get(DOMAIN, {}).get("hub")
 
@@ -415,16 +346,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _start_hub)
 
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    if entry.unique_id == HUB_UNIQUE_ID:
+        # Only the hub's options affect the hub. Sensor entries update their
+        # data as they go (history markers), which mustn't restart it.
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    else:
+        entry.async_on_unload(entry.add_update_listener(_async_sensor_updated))
 
     entity_id = entry.data.get(CONF_ENTITY_ID)
     if entity_id:
         _LOGGER.info("Clean Energy: now managing %s", entity_id)
+        source_device_id = async_entity_id_to_device_id(hass, entity_id)
+
+        # A device now belongs to a single config entry. Versions before
+        # 0.4.0 joined the source's device instead of linking to it, and Home
+        # Assistant 2026.8 split each such device in two, leaving this entry
+        # owning a duplicate with our entities stranded off it. This removes
+        # the duplicate and puts the entities back on the source's device.
+        async_remove_helper_devices(
+            hass,
+            helper_config_entry_id=entry.entry_id,
+            source_device_id=source_device_id,
+            remove_all_devices=True,
+        )
+
+        @callback
+        def _set_source_entity_id(new_entity_id: str) -> None:
+            """Follow the source when it is renamed."""
+            _LOGGER.info(
+                "Clean Energy: %s was renamed to %s; following it",
+                entry.data[CONF_ENTITY_ID],
+                new_entity_id,
+            )
+            taken = any(
+                other.unique_id == new_entity_id
+                for other in hass.config_entries.async_entries(DOMAIN)
+                if other.entry_id != entry.entry_id
+            )
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_ENTITY_ID: new_entity_id},
+                unique_id=entry.unique_id if taken else new_entity_id,
+            )
+            hass.config_entries.async_schedule_reload(entry.entry_id)
+
+        entry.async_on_unload(
+            async_handle_source_entity_changes(
+                hass,
+                helper_config_entry_id=entry.entry_id,
+                set_source_entity_id_or_uuid=_set_source_entity_id,
+                source_device_id=source_device_id,
+                source_entity_id_or_uuid=entity_id,
+            )
+        )
 
         # Forward the sensor platform: this creates the CleanFilterSensor
         # (the user-facing replacement for the source) and the diagnostic
-        # sensors. Backfill of historical LTS happens inside that platform's
-        # async_setup_entry.
+        # sensors.
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
@@ -453,6 +431,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_MONITOR_SENSOR)
 
     return True
+
+
+async def _async_sensor_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Show a changed per-sensor threshold without waiting for a reading.
+
+    The filter reads the threshold on every reading, so this is display only.
+    """
+    clean = getattr(entry, "runtime_data", None)
+    if clean is not None and clean.hass is not None:
+        clean.async_write_ha_state()
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:

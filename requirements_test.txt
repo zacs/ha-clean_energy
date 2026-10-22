@@ -1,3 +1,8 @@
 pytest>=8.0.0
 pytest-asyncio
-pytest-homeassistant-custom-component
+# 0.13.354 is the first release built on Home Assistant 2026.8.0, the oldest
+# version this integration supports (single-config-entry devices, and the
+# helper-integration API it relies on). Every 2026.7+ release needs Python
+# 3.14, so on 3.13 the resolver silently falls back to a far older one.
+pytest-homeassistant-custom-component>=0.13.354
+freezegun

@@ -3,14 +3,14 @@
     "step": {
       "user": {
         "title": "Clean Energy",
-        "description": "Monitors energy sensors for anomalous spikes and corrects long-term statistics. Set the maximum realistic power draw for any single sensor. After install, additional sensors are added automatically when a spike is detected, or manually via the `clean_energy.monitor_sensor` service.",
+        "description": "Watches every cumulative energy sensor for impossible jumps. Set the maximum realistic power draw for any single sensor; individual sensors can be given a lower one later. When a spike is caught you'll be asked whether to monitor that sensor, or you can add one any time with the `clean_energy.monitor_sensor` action. Each monitored sensor gets a parallel (Clean) sensor; the original is never modified.",
         "data": {
           "max_power_kw": "Max realistic power draw (kW)"
         }
       },
       "confirm": {
         "title": "Spike detected: {name}",
-        "description": "A suspicious spike was detected on **{entity_id}**: {spike_from} → {spike_to} {spike_unit} (implied {implied_power_kw} kW).\n\nWould you like Clean Energy to automatically correct future spikes on this sensor?"
+        "description": "A suspicious spike was detected on **{entity_id}**: {spike_from} → {spike_to} {spike_unit} (implied {implied_power_kw} kW).\n\nMonitor this sensor? Clean Energy will create a parallel (Clean) sensor that leaves out impossible jumps, including ones already in its history."
       }
     },
     "abort": {
@@ -30,10 +30,10 @@
         }
       },
       "sensor": {
-        "title": "Repair Clean sensor",
-        "description": "Adjust the offset (in the source sensor's unit) that the Clean entity for **{entity_id}** subtracts from the source. If the spike was missed at discovery time and the Clean sensor is currently mirroring the bogus value, set this to (current_source_reading − last_known_good_reading) and save.",
+        "title": "Clean sensor options",
+        "description": "Maximum realistic power draw for **{entity_id}** alone. A jump implying more than this is treated as a glitch. Leave empty to use the global {hub_max_power_kw} kW, which has to suit whole-home meters; a much lower value suits small devices (a smart plug can't draw more than a few kW).",
         "data": {
-          "initial_offset": "Offset to subtract from source"
+          "max_power_kw": "Max realistic power draw (kW)"
         }
       }
     }
@@ -46,6 +46,20 @@
         "entity_id": {
           "name": "Energy sensor",
           "description": "The total_increasing energy sensor to start monitoring."
+        }
+      }
+    },
+    "rebuild_history": {
+      "name": "Rebuild history",
+      "description": "Re-derive a Clean sensor's long-term statistics from its source's, leaving out impossible jumps, and correct its current value to match. Use once on Clean sensors created before 0.4.0, whose history was copied with spikes included.",
+      "fields": {
+        "offset": {
+          "name": "Offset",
+          "description": "Optional. Energy (in the source's unit) known to be bogus in the source's current reading, for a spike that predates its recorded history. Overrides the value derived from history."
+        },
+        "force": {
+          "name": "Force",
+          "description": "Rebuild even though the Clean sensor has statistics older than any recorded for its source. Those older statistics are discarded."
         }
       }
     }

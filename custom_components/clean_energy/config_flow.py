@@ -39,21 +39,13 @@ from .const import (
     DOMAIN,
     HUB_UNIQUE_ID,
 )
+from .entries import max_power_kw
+from .spike import is_energy_sensor
 
 
 def _is_energy_sensor(hass, entity_id: str) -> bool:
     """Check if an entity is a total_increasing energy sensor."""
-    # Lazy import to avoid a circular dependency with ``__init__``.
-    from . import ENERGY_UNITS  # noqa: PLC0415
-
-    state = hass.states.get(entity_id)
-    if state is None:
-        return False
-    attrs = state.attributes
-    return (
-        attrs.get("state_class") == "total_increasing"
-        and attrs.get("unit_of_measurement", "") in ENERGY_UNITS
-    )
+    return is_energy_sensor(hass.states.get(entity_id))
 
 
 class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -169,7 +161,7 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 try:
                     current_val = float(current_state.state)
                     initial_offset = max(0.0, current_val - float(pre_spike))
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     initial_offset = 0.0
 
             name = self._friendly_name(entity_id)
@@ -223,11 +215,16 @@ class CleanEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 class CleanEnergyOptionsFlow(OptionsFlow):
     """Options flow.
 
-    * Hub entry (no entity_id): edit the global max-power threshold.
-    * Per-sensor entry: edit the initial offset, which is what the Clean
-      sensor subtracts from the source. Useful for repairing an entry
-      whose spike was missed at discovery time (so the Clean sensor is
-      currently mirroring the bogus spiked value).
+    * Hub entry: the global max-power threshold, used for discovery and for
+      every sensor without its own.
+    * Per-sensor entry: an optional max-power threshold for just that sensor.
+      Leaving it empty inherits the hub's. A low ceiling suits small devices:
+      a smart plug can't draw more than a few kW, so a jump implying more is
+      a glitch even when it is far below a whole-home meter's ceiling.
+
+    Sensors no longer take a manual offset here. Applying one meant changing
+    a running total in place, which the recorder counts as consumption; the
+    ``clean_energy.rebuild_history`` action corrects it safely instead.
     """
 
     async def async_step_init(
@@ -246,7 +243,9 @@ class CleanEnergyOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_MAX_POWER_KW, default=current): vol.Coerce(float),
+                    vol.Required(CONF_MAX_POWER_KW, default=current): vol.All(
+                        vol.Coerce(float), vol.Range(min=0.1)
+                    ),
                 }
             ),
         )
@@ -254,37 +253,27 @@ class CleanEnergyOptionsFlow(OptionsFlow):
     async def async_step_sensor(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Edit per-sensor options (initial offset).
-
-        We store the offset on ``entry.data`` rather than ``entry.options``
-        because the filter sensor reads it once at seed time; persisting it
-        in ``data`` keeps the read path simple and avoids an options/data
-        precedence question on every state change.
-        """
-        entry = self.config_entry
+        """Edit per-sensor options."""
         if user_input is not None:
-            new_offset = float(user_input[CONF_INITIAL_OFFSET])
-            self.hass.config_entries.async_update_entry(
-                entry,
-                data={**entry.data, CONF_INITIAL_OFFSET: new_offset},
+            # An empty field means "inherit the hub's", so drop the key.
+            return self.async_create_entry(
+                title="",
+                data={k: v for k, v in user_input.items() if v is not None},
             )
-            # Reload so the filter sensor re-seeds with the new offset.
-            self.hass.async_create_task(
-                self.hass.config_entries.async_reload(entry.entry_id)
-            )
-            return self.async_create_entry(title="", data={})
 
-        current = float(entry.data.get(CONF_INITIAL_OFFSET, 0.0))
+        current = self.config_entry.options.get(CONF_MAX_POWER_KW)
         return self.async_show_form(
             step_id="sensor",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_INITIAL_OFFSET, default=current): vol.Coerce(
-                        float
-                    ),
+                    vol.Optional(
+                        CONF_MAX_POWER_KW,
+                        description={"suggested_value": current},
+                    ): vol.All(vol.Coerce(float), vol.Range(min=0.1)),
                 }
             ),
             description_placeholders={
-                "entity_id": entry.data.get(CONF_ENTITY_ID, ""),
+                "entity_id": self.config_entry.data.get(CONF_ENTITY_ID, ""),
+                "hub_max_power_kw": f"{max_power_kw(self.hass):g}",
             },
         )

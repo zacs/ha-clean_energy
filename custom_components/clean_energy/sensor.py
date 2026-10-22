@@ -3,7 +3,7 @@
 For each monitored source sensor we expose:
 
 * ``CleanFilterSensor`` — a parallel ``total_increasing`` energy entity that
-  mirrors the source's value but holds flat across spikes. The Energy
+  counts the source's real consumption and drops impossible jumps. The Energy
   Dashboard should be pointed at this entity instead of the original. The
   source entity is left completely untouched (no LTS adjustments, no history
   rewrites), so the integration is non-destructive.
@@ -12,26 +12,19 @@ For each monitored source sensor we expose:
   Removed``, ``Spike Count``) — these listen to a dispatcher signal that the
   filter sensor fires whenever it suppresses a spike.
 
-On first setup we copy the source sensor's existing hourly Long-Term
-Statistics history over to the new clean entity (best effort) so that the
-dashboard retains continuity when the user swaps over.
+A new clean sensor derives both its starting value and its long-term
+statistics from the source's history, with spikes removed (see history.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMeanType,
-    StatisticMetaData,
-)
-from homeassistant.components.recorder.statistics import (
-    async_import_statistics,
-    statistics_during_period,
-)
+from homeassistant.components.recorder import is_entity_recorded
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -39,8 +32,14 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
-from homeassistant.core import Event, HomeAssistant, callback, split_entity_id
-from homeassistant.helpers import device_registry as dr
+from homeassistant.core import (
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    callback,
+    split_entity_id,
+)
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device import async_entity_id_to_device
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.dispatcher import (
@@ -57,45 +56,37 @@ from homeassistant.helpers.restore_state import (
 )
 from homeassistant.util import dt as dt_util
 
+from . import history
 from .const import (
-    BACKFILL_DONE_KEY,
     CONF_ENTITY_ID,
     CONF_INITIAL_OFFSET,
-    CONF_MAX_POWER_KW,
-    DEFAULT_MAX_POWER_KW,
-    DOMAIN,
-    MIN_ELAPSED_SECONDS,
-    MIN_SPIKE_KWH,
+    HISTORY_DONE_KEY,
+    LEGACY_BACKFILL_DONE_KEY,
+    RESEED_TOLERANCE_KWH,
     SIGNAL_SPIKE_CORRECTED,
-    STORE_APPLIED_OFFSET,
     STORE_LAST_SOURCE,
     STORE_LAST_SOURCE_TS,
     STORE_NATIVE,
     STORE_SUPPRESSED,
     STORE_UNIT,
+    CleanEnergyFeature,
+)
+from .entries import max_power_kw
+from .spike import (
+    CleanHistory,
+    confirmed_at,
+    continue_history,
+    convert,
+    derive_clean_history,
+    implied_kw,
+    is_spike,
+    reading,
+    to_kwh,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 _INVALID_STATES = (STATE_UNKNOWN, STATE_UNAVAILABLE, None)
-
-# Conversion factors to kWh (kept local to avoid an import cycle with __init__).
-_TO_KWH: dict[str, float] = {
-    UnitOfEnergy.KILO_WATT_HOUR: 1.0,
-    UnitOfEnergy.WATT_HOUR: 0.001,
-    UnitOfEnergy.MEGA_WATT_HOUR: 1000.0,
-    "kWh": 1.0,
-    "Wh": 0.001,
-    "MWh": 1000.0,
-}
-
-
-def _hub_max_power_kw(hass: HomeAssistant) -> float:
-    """Read the global max-power threshold from the hub config entry."""
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        if not entry.data.get(CONF_ENTITY_ID):
-            return entry.options.get(CONF_MAX_POWER_KW, DEFAULT_MAX_POWER_KW)
-    return DEFAULT_MAX_POWER_KW
 
 
 def _parent_friendly_name(hass: HomeAssistant, entity_id: str) -> str:
@@ -104,34 +95,6 @@ def _parent_friendly_name(hass: HomeAssistant, entity_id: str) -> str:
     if state and state.attributes.get("friendly_name"):
         return state.attributes["friendly_name"]
     return split_entity_id(entity_id)[1].replace("_", " ").title()
-
-
-@callback
-def _async_unlink_adopted_devices(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Drop this config entry from any device it was implicitly added to.
-
-    Clean Energy owns no devices — it only puts its entities on the source's
-    device. But handing the entity platform a DeviceInfo carrying that
-    device's identifiers (what the old, now-deprecated helper produced)
-    implicitly added this config entry to the device. The device then lists
-    Clean Energy among its integrations forever, and Home Assistant, which
-    cannot represent a single-config-entry device that way, splits it.
-
-    Assigning ``device_entry`` needs no such link, so anything left over from
-    the old approach is stale and gets removed here. Run before the entities
-    are added, so that adding them re-establishes the correct device.
-    """
-    device_registry = dr.async_get(hass)
-    for device in list(
-        device_registry.devices.get_devices_for_config_entry_id(entry.entry_id)
-    ):
-        _LOGGER.info(
-            "Clean Energy: removing stale config entry link from device %s",
-            device.name or device.id,
-        )
-        device_registry.async_update_device(
-            device.id, remove_config_entry_id=entry.entry_id
-        )
 
 
 async def async_setup_entry(
@@ -145,19 +108,17 @@ async def async_setup_entry(
         # Hub entry — no sensors.
         return
 
-    # Resolve the source's device directly. ``async_device_info_to_link_from_entity``
-    # is deprecated and now always returns None: a DeviceInfo carrying another
-    # device's identifiers implicitly adopted that device into our config entry,
-    # which a single-config-entry device cannot represent. The supported way to
-    # put an entity on someone else's device is to assign ``device_entry``, which
-    # the entity platform honours when ``device_info`` is None.
+    # A device belongs to a single config entry, so a helper links its
+    # entities to the source's device rather than joining that device. The
+    # entity platform honours ``device_entry`` when ``device_info`` is None.
     device_entry = async_entity_id_to_device(hass, entity_id)
-    _async_unlink_adopted_devices(hass, entry)
     parent_friendly = _parent_friendly_name(hass, entity_id)
 
+    clean = CleanFilterSensor(entry, entity_id, device_entry, parent_friendly)
+    entry.runtime_data = clean
     async_add_entities(
         [
-            CleanFilterSensor(entry, entity_id, device_entry, parent_friendly),
+            clean,
             LastSpikeTimeSensor(entry, entity_id, device_entry, parent_friendly),
             LastSpikeSizeSensor(entry, entity_id, device_entry, parent_friendly),
             TotalCorrectedSensor(entry, entity_id, device_entry, parent_friendly),
@@ -167,122 +128,54 @@ async def async_setup_entry(
 
 
 # ---------------------------------------------------------------------------
-# History backfill
-# ---------------------------------------------------------------------------
-
-
-async def _backfill_history(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    source_id: str,
-    target_id: str,
-    parent_friendly: str,
-) -> None:
-    """Copy the source sensor's hourly LTS over to the new clean entity.
-
-    Best effort: failures don't block setup. We only copy hours strictly
-    before the current hour to avoid stepping on the recorder's live
-    compilation of the in-progress hour for the new entity.
-    """
-    source_state = hass.states.get(source_id)
-    unit = (
-        source_state.attributes.get("unit_of_measurement", "kWh")
-        if source_state
-        else "kWh"
-    )
-
-    now = dt_util.utcnow()
-    end_time = now.replace(minute=0, second=0, microsecond=0)
-    start_time = dt_util.utc_from_timestamp(0)
-
-    def _fetch() -> dict:
-        return statistics_during_period(
-            hass,
-            start_time,
-            end_time,
-            {source_id},
-            "hour",
-            None,
-            {"sum", "state"},
-        )
-
-    try:
-        rows = await get_instance(hass).async_add_executor_job(_fetch)
-    except Exception:
-        _LOGGER.exception("Clean Energy: failed to fetch LTS history for %s", source_id)
-        return
-
-    series = rows.get(source_id) or []
-    if not series:
-        _LOGGER.info("Clean Energy: no prior LTS history to backfill for %s", source_id)
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, BACKFILL_DONE_KEY: True}
-        )
-        return
-
-    statistics: list[StatisticData] = []
-    for row in series:
-        start = row.get("start")
-        if isinstance(start, (int, float)):
-            # statistics_during_period returns timestamps in seconds when
-            # called from Python (the WS layer multiplies by 1000 itself).
-            start_dt = dt_util.utc_from_timestamp(float(start))
-        elif isinstance(start, datetime):
-            start_dt = start
-        else:
-            continue
-        start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
-        stat: StatisticData = {"start": start_dt}
-        if (s := row.get("sum")) is not None:
-            stat["sum"] = float(s)
-        if (st := row.get("state")) is not None:
-            stat["state"] = float(st)
-        if "sum" not in stat and "state" not in stat:
-            continue
-        statistics.append(stat)
-
-    if not statistics:
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, BACKFILL_DONE_KEY: True}
-        )
-        return
-
-    metadata: StatisticMetaData = {
-        "mean_type": StatisticMeanType.NONE,
-        "has_sum": True,
-        "name": f"{parent_friendly} (Clean)",
-        "source": "recorder",
-        "statistic_id": target_id,
-        "unit_class": "energy",
-        "unit_of_measurement": unit,
-    }
-
-    try:
-        async_import_statistics(hass, metadata, statistics)
-    except Exception:
-        _LOGGER.exception(
-            "Clean Energy: failed to import backfilled history into %s", target_id
-        )
-        return
-
-    _LOGGER.info(
-        "Clean Energy: backfilled %d hourly LTS rows from %s into %s",
-        len(statistics),
-        source_id,
-        target_id,
-    )
-    hass.config_entries.async_update_entry(
-        entry, data={**entry.data, BACKFILL_DONE_KEY: True}
-    )
-
-
-# ---------------------------------------------------------------------------
 # Filter sensor: a clean parallel of the source
 # ---------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _Rebuild:
+    """What a history rebuild found, and what it will do."""
+
+    history: CleanHistory | None
+    # The source reading the plan was made against.
+    source: float
+    unit: str
+    at: datetime
+    value_before: float | None
+    # The running total to adopt; None when the source has no history to
+    # derive one from, in which case discovery's recorded offset applies.
+    value_after: float | None
+
+    @property
+    def changes_value(self) -> bool:
+        """Whether adopting the plan moves the running total."""
+        if self.value_after is None:
+            return self.value_before is None
+        if self.value_before is None:
+            return True
+        delta = to_kwh(abs(self.value_after - self.value_before), self.unit)
+        return delta >= RESEED_TOLERANCE_KWH
+
+    def summary(self, entity_id: str, source_id: str) -> dict[str, Any]:
+        """Describe the rebuild for a service response."""
+        hist = self.history
+        corrected = self.changes_value and self.value_before is not None
+        after = self.value_after if corrected else self.value_before
+        return {
+            "entity_id": entity_id,
+            "source": source_id,
+            "unit": self.unit,
+            "history_hours": len(hist.rows) if hist else 0,
+            "spike_hours": [h.isoformat() for h in hist.spike_hours] if hist else [],
+            "energy_removed": round(hist.suppressed, 3) if hist else 0.0,
+            "value_before": self.value_before,
+            "value_after": None if after is None else round(after, 3),
+            "value_corrected": corrected,
+        }
+
+
 class CleanFilterSensor(RestoreEntity, SensorEntity):
-    """A ``total_increasing`` energy sensor that mirrors the source, sans spikes.
+    """A ``total_increasing`` energy sensor that counts the source, sans spikes.
 
     Real flaky meters typically spike *permanently*: the meter reports a
     bogus value once, then keeps reporting from that bogus value forever
@@ -301,13 +194,11 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
       it is. We never counted the bogus energy, so there is nothing to undo.
 
     Because the total only ever moves by increments we chose to accept, it
-    cannot go negative and cannot double-count — which matters, because the
-    recorder discards *every* statistics row for a ``total_increasing``
-    sensor whose state is negative, leaving the Energy Dashboard blank.
+    cannot go negative and cannot double-count.
 
     The state is restored across restarts. Rebuilding it from the config
-    entry alone would re-apply the entry's one-time ``initial_offset`` to a
-    source that has since moved on.
+    entry alone would re-apply a one-time offset to a source that has since
+    moved on.
     """
 
     _attr_has_entity_name = False
@@ -315,6 +206,7 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_suggested_display_precision = 3
+    _attr_supported_features = CleanEnergyFeature.REBUILD_HISTORY
 
     def __init__(
         self,
@@ -329,6 +221,9 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
         self._parent_friendly = parent_friendly
         self._attr_unique_id = f"{entry.entry_id}_clean"
         self._attr_name = f"{parent_friendly} (Clean)"
+        # Suggest sensor.<source>_clean. Home Assistant otherwise prefixes the
+        # device name, and an existing entity keeps whatever id it already has.
+        self.entity_id = f"sensor.{split_entity_id(source_id)[1]}_clean"
         if device_entry:
             self.device_entry = device_entry
         self._native: float | None = None
@@ -337,13 +232,10 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
         # Cumulative energy we have refused to count, for diagnostics.
         self._suppressed: float = 0.0
         self._unit: str = UnitOfEnergy.KILO_WATT_HOUR
-        # One-time correction captured at entry-creation time. Without it, a
-        # sensor whose spike *triggered* discovery would be seeded from the
-        # already-spiked source and mirror the spike one-for-one. It applies
-        # only when seeding; from then on the accumulator carries the state.
-        self._configured_offset: float = float(
-            entry.data.get(CONF_INITIAL_OFFSET, 0.0) or 0.0
-        )
+        # Set while a new sensor waits for its history-derived starting value,
+        # so a reading arriving meanwhile doesn't seed it from a spiked source.
+        self._awaiting_seed = False
+        self._rebuild_task: asyncio.Task[None] | None = None
 
     @property
     def native_value(self) -> float | None:
@@ -365,6 +257,7 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
             "last_source_time": (
                 self._last_source_time.isoformat() if self._last_source_time else None
             ),
+            "max_power_kw": max_power_kw(self.hass, self._entry),
         }
 
     @property
@@ -381,57 +274,42 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
                 ),
                 STORE_SUPPRESSED: self._suppressed,
                 STORE_UNIT: self._unit,
-                STORE_APPLIED_OFFSET: self._configured_offset,
             }
         )
 
     async def async_added_to_hass(self) -> None:
-        """Restore prior state (or seed from the source) and start tracking."""
+        """Restore prior state (or seed) and start tracking the source."""
         await super().async_added_to_hass()
 
         restored = await self.async_get_last_extra_data()
-        if not self._restore_previous_state(restored.as_dict() if restored else None):
-            self._seed_from_source()
+        restored_ok = self._restore_previous_state(
+            restored.as_dict() if restored else None
+        )
 
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass, [self._source_id], self._handle_source_change
             )
         )
+        self.async_on_remove(self._cancel_rebuild)
 
-        if not self._entry.data.get(BACKFILL_DONE_KEY):
-            # Use our real entity_id — it is only assigned once the platform
-            # has added us, and guessing it from the source's object_id writes
-            # statistics under a statistic_id that may not exist.
-            self.hass.async_create_task(
-                _backfill_history(
-                    self.hass,
-                    self._entry,
-                    self._source_id,
-                    self.entity_id,
-                    self._parent_friendly,
-                )
-            )
+        data = self._entry.data
+        if data.get(HISTORY_DONE_KEY) or data.get(LEGACY_BACKFILL_DONE_KEY):
+            # Up and running, or created before history was derived; the
+            # latter's statistics are only rewritten when the user asks.
+            if not restored_ok:
+                self._seed_from_source()
+            return
+
+        # A new sensor (or one whose first rebuild was interrupted): derive the
+        # starting value and statistics from the source's history.
+        self._awaiting_seed = not restored_ok
+        self._start_rebuild()
 
     def _restore_previous_state(self, stored: dict | None) -> bool:
-        """Adopt the accumulator state saved before the last restart.
-
-        Returns False when there is nothing usable to restore, or when the
-        entry's ``initial_offset`` has been edited since — that edit is the
-        user asking for a re-seed, so the stored total is deliberately
-        discarded.
-        """
+        """Adopt the accumulator state saved before the last restart."""
         if stored is None:
             return False
-        if stored.get(STORE_APPLIED_OFFSET) != self._configured_offset:
-            _LOGGER.info(
-                "Clean Energy: initial offset for %s changed to %.3f; "
-                "re-seeding the clean value from the source.",
-                self._source_id,
-                self._configured_offset,
-            )
-            return False
-
         native = stored.get(STORE_NATIVE)
         last_source = stored.get(STORE_LAST_SOURCE)
         ts = stored.get(STORE_LAST_SOURCE_TS)
@@ -445,38 +323,30 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
             self._native = max(0.0, float(native))
             self._last_source = float(last_source)
             self._suppressed = float(stored.get(STORE_SUPPRESSED) or 0.0)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return False
         self._last_source_time = last_source_time
         self._unit = stored.get(STORE_UNIT) or UnitOfEnergy.KILO_WATT_HOUR
         return True
 
+    # -- Seeding without history ---------------------------------------------
+
     def _seed_from_source(self) -> None:
         """Adopt the source's current reading as our starting point."""
         state = self.hass.states.get(self._source_id)
-        if state is None or state.state in _INVALID_STATES:
+        if (current := reading(state)) is None:
             # Stay unknown; the first real reading will seed us.
             return
-        try:
-            value = float(state.state)
-        except (ValueError, TypeError):
-            return
-        self._seed(
-            value,
-            state.attributes.get("unit_of_measurement", UnitOfEnergy.KILO_WATT_HOUR),
-            state.last_changed or dt_util.utcnow(),
-        )
+        assert state is not None  # reading() returned a value
+        self._seed(*current, state.last_changed)
 
     def _seed(self, value: float, unit: str, when: datetime) -> None:
-        """Seed the accumulator, applying (and validating) the initial offset."""
-        offset = self._configured_offset
+        """Seed from a reading, less the offset discovery recorded."""
+        offset = float(self._entry.data.get(CONF_INITIAL_OFFSET, 0.0) or 0.0)
         if offset > value:
             # The offset was captured while the source was spiked, but the
             # source now reads *below* it — the spike reverted, so there is no
             # longer anything in the source for the offset to cancel out.
-            # Applying it anyway drives us negative, and the recorder throws
-            # away every statistics row for a negative total_increasing
-            # sensor, which is what leaves the Energy Dashboard empty.
             _LOGGER.warning(
                 "Clean Energy: stored initial offset of %.3f %s for %s exceeds the "
                 "source's current value of %.3f %s — the spike it was meant to "
@@ -489,66 +359,257 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
                 unit,
             )
             offset = 0.0
-            self._clear_configured_offset()
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, CONF_INITIAL_OFFSET: 0.0}
+            )
+        self._set_running_total(max(0.0, value - offset), value, unit, when)
 
-        self._native = max(0.0, value - offset)
-        self._last_source = value
+    def _set_running_total(
+        self, native: float, source: float, unit: str, when: datetime
+    ) -> None:
+        self._native = native
+        self._last_source = source
         self._last_source_time = when
         self._unit = unit
+        self._awaiting_seed = False
 
-    def _clear_configured_offset(self) -> None:
-        """Drop a stale initial offset from the config entry, permanently."""
-        self._configured_offset = 0.0
-        self.hass.config_entries.async_update_entry(
-            self._entry,
-            data={**self._entry.data, CONF_INITIAL_OFFSET: 0.0},
+    # -- History rebuild -----------------------------------------------------
+
+    @callback
+    def _start_rebuild(self) -> None:
+        self._rebuild_task = self._entry.async_create_background_task(
+            self.hass,
+            self._async_first_rebuild(),
+            name=f"clean_energy rebuild {self._source_id}",
         )
+
+    @callback
+    def _cancel_rebuild(self) -> None:
+        if self._rebuild_task is not None and not self._rebuild_task.done():
+            self._rebuild_task.cancel()
+
+    def _rebuilding(self) -> bool:
+        return self._rebuild_task is not None and not self._rebuild_task.done()
+
+    async def async_rebuild_history(
+        self, offset: float | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        """Re-derive this sensor's statistics from its source, sans spikes.
+
+        Returns what was found and changed. The statistics themselves are
+        replaced in the background over the next few minutes, because the
+        recorder has to compile in between (see history.py).
+        """
+        if self._rebuilding():
+            raise ServiceValidationError(
+                f"A history rebuild for {self.entity_id} is already in progress"
+            )
+        plan = await self._async_plan(offset=offset, force=force)
+        if plan is None:
+            raise ServiceValidationError(
+                f"{self._source_id} has no current reading to rebuild from"
+            )
+        self._apply(plan)
+        self._rebuild_task = self._entry.async_create_background_task(
+            self.hass,
+            self._async_replace_statistics(plan),
+            name=f"clean_energy rebuild {self._source_id}",
+        )
+        return plan.summary(self.entity_id, self._source_id)
+
+    async def _async_first_rebuild(self) -> None:
+        """Derive a new sensor's starting value and statistics."""
+        try:
+            plan = await self._async_plan(offset=None, force=True)
+        except Exception:
+            _LOGGER.exception(
+                "Clean Energy: couldn't read the history of %s; seeding from its "
+                "current reading instead",
+                self._source_id,
+            )
+            if self._native is None:
+                self._awaiting_seed = False
+                self._seed_from_source()
+                self.async_write_ha_state()
+            return
+        if plan is None:
+            # No reading yet (its integration is still starting). The first
+            # reading to arrive restarts this; see _handle_source_change.
+            return
+        self._apply(plan)
+        await self._async_replace_statistics(plan)
+
+    async def _async_plan(
+        self, *, offset: float | None, force: bool
+    ) -> _Rebuild | None:
+        """Fetch the source's history and work out the clean running total.
+
+        Returns None if the source has no reading to work from.
+        """
+        if (current := reading(self.hass.states.get(self._source_id))) is None:
+            return None
+        unit = current[1]
+        limit = max_power_kw(self.hass, self._entry)
+
+        hist = None
+        if is_entity_recorded(self.hass, self._source_id):
+            rows = await history.async_source_hours(self.hass, self._source_id, unit)
+            hist = derive_clean_history(rows, unit, limit)
+
+        if (
+            hist is not None
+            and not force
+            and await history.async_has_hours_before(
+                self.hass, self.entity_id, hist.rows[0]["start"]
+            )
+        ):
+            raise ServiceValidationError(
+                f"{self.entity_id} has statistics older than any recorded for "
+                f"{self._source_id}; rebuilding would discard them. Pass force: "
+                "true to rebuild anyway."
+            )
+
+        # Read the source again: a reading may have arrived during the fetch.
+        # Keep working in the unit the history was fetched in.
+        state = self.hass.states.get(self._source_id)
+        if (current := reading(state)) is None:
+            return None
+        assert state is not None  # reading() returned a value
+        value = convert(current[0], current[1], unit)
+        now = state.last_changed
+
+        if offset is not None:
+            target: float | None = max(0.0, value - offset)
+        elif hist is not None:
+            target, _ = continue_history(hist, value, now, unit, limit)
+        else:
+            target = None
+
+        before = self._native
+        if before is not None and self._unit != unit:
+            before = convert(before, self._unit, unit)
+        return _Rebuild(
+            history=hist,
+            source=value,
+            unit=unit,
+            at=now,
+            value_before=None if before is None else round(before, 3),
+            value_after=target,
+        )
+
+    def _apply(self, plan: _Rebuild) -> None:
+        """Adopt the planned running total, if it changes anything."""
+        if not plan.changes_value:
+            return
+        if plan.value_after is None:
+            # No history to derive from: fall back to discovery's offset.
+            self._seed(plan.source, plan.unit, plan.at)
+        else:
+            self._set_running_total(plan.value_after, plan.source, plan.unit, plan.at)
+        self.async_write_ha_state()
+
+    async def _async_replace_statistics(self, plan: _Rebuild) -> None:
+        """Swap our statistics for the derived ones (see history.py)."""
+        entity_id = self.entity_id
+        if plan.history is None or not is_entity_recorded(self.hass, entity_id):
+            self._mark_history_done()
+            return
+
+        if plan.changes_value:
+            # Step 1: let the window holding the new value compile first.
+            window = history.five_minute_floor(dt_util.utcnow())
+            if not await history.async_wait_for_compile(self.hass, entity_id, window):
+                self._warn_compile_timeout()
+                return
+
+        # Step 2: replace. Refetch, in case an hour closed while waiting.
+        await history.async_wait_out_compile_boundary(self.hass)
+        limit = max_power_kw(self.hass, self._entry)
+        rows = await history.async_source_hours(self.hass, self._source_id, plan.unit)
+        hist = derive_clean_history(rows, plan.unit, limit) or plan.history
+        await history.async_wait_out_compile_boundary(self.hass)
+        cleared_at = dt_util.utcnow()
+        history.async_replace_statistics(
+            self.hass,
+            entity_id,
+            f"{self._parent_friendly} (Clean)",
+            plan.unit,
+            hist.rows,
+        )
+
+        # Step 3: once the recorder restarts the sum at 0, lift it onto history.
+        window = history.five_minute_floor(cleared_at)
+        if not await history.async_wait_for_compile(self.hass, entity_id, window):
+            self._warn_compile_timeout()
+            return
+        history.async_shift_statistics(
+            self.hass, entity_id, window, hist.total, plan.unit
+        )
+        self._mark_history_done()
+        _LOGGER.info(
+            "Clean Energy: rebuilt %s from %d hours of %s, removing %.3f %s across "
+            "%d spike hour(s)",
+            entity_id,
+            len(hist.rows),
+            self._source_id,
+            hist.suppressed,
+            plan.unit,
+            len(hist.spike_hours),
+        )
+
+    def _warn_compile_timeout(self) -> None:
+        _LOGGER.warning(
+            "Clean Energy: the recorder didn't compile statistics for %s in time; "
+            "its history will be rebuilt after the next restart",
+            self.entity_id,
+        )
+
+    def _mark_history_done(self) -> None:
+        if not self._entry.data.get(HISTORY_DONE_KEY):
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, HISTORY_DONE_KEY: True}
+            )
+
+    # -- Live filtering ------------------------------------------------------
 
     def _rescale(self, unit: str) -> None:
         """Convert our running total if the source changed units under us."""
         if unit == self._unit:
             return
-        old_factor = _TO_KWH.get(self._unit)
-        new_factor = _TO_KWH.get(unit)
-        if old_factor is not None and new_factor:
-            scale = old_factor / new_factor
-            if self._native is not None:
-                self._native *= scale
-            if self._last_source is not None:
-                self._last_source *= scale
+        if self._native is not None:
+            self._native = convert(self._native, self._unit, unit)
+        if self._last_source is not None:
+            self._last_source = convert(self._last_source, self._unit, unit)
         self._unit = unit
 
     @callback
-    def _handle_source_change(self, event: Event) -> None:
-        new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in _INVALID_STATES:
+    def _handle_source_change(self, event: Event[EventStateChangedData]) -> None:
+        new_state = event.data["new_state"]
+        if (current := reading(new_state)) is None:
             return
-        try:
-            new_val = float(new_state.state)
-        except (ValueError, TypeError):
-            return
+        assert new_state is not None  # reading() returned a value
+        value, unit = current
+        now = new_state.last_changed
 
-        unit = new_state.attributes.get("unit_of_measurement", "kWh")
-        factor = _TO_KWH.get(unit)
-        if factor is None:
-            return
-
-        now = new_state.last_changed or dt_util.utcnow()
-        self._rescale(unit)
-
-        # First reading: just seed.
         if (
             self._native is None
             or self._last_source is None
             or self._last_source_time is None
         ):
-            self._seed(new_val, unit, now)
+            if self._awaiting_seed:
+                # The first rebuild seeds from the latest reading. If it has
+                # already given up for lack of one, this reading restarts it.
+                if not self._rebuilding():
+                    self._start_rebuild()
+                return
+            self._seed(value, unit, now)
             self.async_write_ha_state()
             return
 
-        diff = new_val - self._last_source
+        self._rescale(unit)
+        increase = value - self._last_source
 
-        if diff < 0:
+        if increase < 0:
             # The source fell. Either a transient spike reverting, or a
             # genuine total_increasing reset (e.g. a manual Z-Wave meter
             # reset). Our total only ever moved by increments we accepted, so
@@ -559,45 +620,45 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
                 "re-anchoring, clean total stays at %.3f %s.",
                 self._source_id,
                 self._last_source,
-                new_val,
+                value,
                 unit,
                 self._native,
                 unit,
             )
-            self._last_source = new_val
+            self._last_source = value
             self._last_source_time = now
             self.async_write_ha_state()
             return
 
-        if diff == 0:
+        if increase == 0:
             return
 
-        jump_kwh = diff * factor
-        elapsed = max(
-            (now - self._last_source_time).total_seconds(), MIN_ELAPSED_SECONDS
+        since = confirmed_at(
+            event.data["old_state"], self._last_source, unit, self._last_source_time
         )
-        implied_kw = jump_kwh / (elapsed / 3600.0)
-        threshold_kw = _hub_max_power_kw(self.hass)
+        elapsed = (now - since).total_seconds()
+        jump_kwh = to_kwh(increase, unit)
+        limit = max_power_kw(self.hass, self._entry)
 
-        if jump_kwh >= MIN_SPIKE_KWH and implied_kw > threshold_kw:
+        if is_spike(jump_kwh, elapsed, limit):
             # Spike: refuse the increment. Our total stays put, and future
             # increments on top of the (now elevated) source still pass
             # through, because we re-anchor _last_source to the spiked value.
             _LOGGER.warning(
                 "Clean Energy: filtered spike on %s "
-                "(%.3f -> %.3f %s, implied %.1f kW > %.0f kW limit); "
+                "(%.3f -> %.3f %s, implied %.1f kW > %.1f kW limit); "
                 "not counting %.3f kWh (total suppressed now %.3f kWh).",
                 self._source_id,
                 self._last_source,
-                new_val,
+                value,
                 unit,
-                implied_kw,
-                threshold_kw,
+                implied_kw(jump_kwh, elapsed),
+                limit,
                 jump_kwh,
                 self._suppressed + jump_kwh,
             )
             self._suppressed += jump_kwh
-            self._last_source = new_val
+            self._last_source = value
             self._last_source_time = now
             async_dispatcher_send(
                 self.hass,
@@ -609,8 +670,8 @@ class CleanFilterSensor(RestoreEntity, SensorEntity):
             return
 
         # Normal reading: count it.
-        self._native += diff
-        self._last_source = new_val
+        self._native += increase
+        self._last_source = value
         self._last_source_time = now
         self.async_write_ha_state()
 
@@ -645,6 +706,9 @@ class CleanEnergyDiagnosticSensor(RestoreEntity, SensorEntity):
         self._monitored_entity_id = monitored_entity_id
         self._attr_unique_id = f"{entry.entry_id}_{self._id_suffix}"
         self._attr_name = f"{parent_friendly} {self._name_suffix}"
+        self.entity_id = (
+            f"sensor.{split_entity_id(monitored_entity_id)[1]}_{self._id_suffix}"
+        )
         if device_entry:
             self.device_entry = device_entry
 
@@ -711,7 +775,7 @@ class LastSpikeSizeSensor(CleanEnergyDiagnosticSensor):
     def _restore_native_value(self, state: str) -> None:
         try:
             self._attr_native_value = float(state)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             self._attr_native_value = None
 
     @callback
@@ -738,7 +802,7 @@ class TotalCorrectedSensor(CleanEnergyDiagnosticSensor):
     def _restore_native_value(self, state: str) -> None:
         try:
             self._attr_native_value = max(0.0, float(state))
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             self._attr_native_value = 0.0
 
     @callback
@@ -763,7 +827,7 @@ class SpikeCountSensor(CleanEnergyDiagnosticSensor):
     def _restore_native_value(self, state: str) -> None:
         try:
             self._attr_native_value = max(0, int(float(state)))
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             self._attr_native_value = 0
 
     @callback
